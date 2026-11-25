@@ -47,8 +47,8 @@ mkdir -p "$DIST" \
          "$APPDIR/usr/share/icons/hicolor/scalable/apps"
 
 cp -f "$BIN_PATH" "$APPDIR/usr/bin/apprentice"
-cp -f tools/chd.py tools/cdi_extract.py tools/m68k.py tools/os9mod.py tools/analyze.py tools/config.py tools/gen.py tools/steam_register.py "$APPDIR/usr/share/apprentice/tools/"
-cp -f runtime/recomp.h "$APPDIR/usr/share/apprentice/runtime/"
+cp -f tools/chd.py tools/cdi_extract.py tools/m68k.py tools/os9mod.py tools/analyze.py tools/config.py tools/gen.py tools/fetch_compiler.py tools/steam_register.py "$APPDIR/usr/share/apprentice/tools/"
+cp -f runtime/recomp.h runtime/alu.c "$APPDIR/usr/share/apprentice/runtime/"
 cp -f README.md VERSION game.json "$APPDIR/usr/share/apprentice/"
 
 cat > "$APPDIR/AppRun" << 'EOF'

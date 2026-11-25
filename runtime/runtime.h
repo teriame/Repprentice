@@ -42,6 +42,8 @@ enum { HOTKEY_NONE, HOTKEY_SAVE, HOTKEY_SLOT, HOTKEY_LOAD, HOTKEY_INVINCIBLE,
        HOTKEY_RUNAHEAD, HOTKEY_INTERP, HOTKEY_UPSCALER };
 extern int g_edition_hd;            /* edition_hd.c / edition_orig.c */
 extern int g_invincible;            /* F5 */
+extern int g_cdi_pause_req;         /* Select / View button -> trigger original CD-i in-game pause */
+uint32_t cpu_hook_cdi_pause(uint32_t target, uint32_t ret_pc);
 extern int g_audio_muted, g_log_muted;  /* speculative fields (run-ahead, look-ahead) */
 int64_t sched_now(void);
 

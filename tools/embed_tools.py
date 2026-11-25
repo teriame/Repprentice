@@ -15,7 +15,9 @@ FILES = [
     ("tools/analyze.py", "tools/analyze.py"),
     ("tools/config.py", "tools/config.py"),
     ("tools/gen.py", "tools/gen.py"),
+    ("tools/fetch_compiler.py", "tools/fetch_compiler.py"),
     ("runtime/recomp.h", "runtime/recomp.h"),
+    ("runtime/alu.c", "runtime/alu.c"),
     ("game.json", "game.json"),
 ]
 

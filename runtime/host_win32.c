@@ -178,6 +178,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w == VK_ESCAPE) input.quit = 1;
         if (!(l & 0x40000000)) {   /* not auto-repeat */
             if (w == VK_F1) { gui_open = !gui_open; return 0; }
+            if (w == 'P' || w == VK_PAUSE) g_cdi_pause_req = 4;
             if (w == VK_F2) push_hotkey(HOTKEY_SAVE);
             if (w == VK_F3) push_hotkey(HOTKEY_SLOT);
             if (w == VK_F4) push_hotkey(HOTKEY_LOAD);
@@ -341,8 +342,8 @@ static void gamepad_poll_events(int apply_game_input) {
         prev_xi_btns = b;
         xi_rt_held = (g->bRightTrigger > 128);
 
-        /* Back / View / Select (0x0020) toggles in-game Quick Menu */
-        if (pressed & 0x0020) gui_open = !gui_open;
+        /* Start / Menu / Burger (0x0010) toggles in-game Quick Menu */
+        if (pressed & 0x0010) gui_open = !gui_open;
 
         int hx = 0, hy = 0;
         if (b & 0x0001) hy = -1;
@@ -360,9 +361,11 @@ static void gamepad_poll_events(int apply_game_input) {
             if (hy > 0 && prev_xi_hat_y <= 0) gui_nav_down = 1;
             if (hx < 0 && prev_xi_hat_x >= 0) gui_nav_left = 1;
             if (hx > 0 && prev_xi_hat_x <= 0) gui_nav_right = 1;
-            if (pressed & (0x1000 | 0x0010)) gui_nav_ok = 1;    /* A or Start */
-            if (pressed & 0x2000) gui_nav_back = 1;             /* B */
+            if (pressed & 0x1000) gui_nav_ok = 1;                /* A */
+            if (pressed & (0x2000 | 0x0020)) gui_nav_back = 1;   /* B or Back/Select */
         } else {
+            /* Back / View / Select (0x0020) triggers original CD-i in-game pause screen */
+            if (pressed & 0x0020) g_cdi_pause_req = 4;
             if (pressed & 0x0100) push_hotkey(HOTKEY_SAVE);     /* LB / L1 */
             if (pressed & 0x0200) push_hotkey(HOTKEY_LOAD);     /* RB / R1 */
             if (apply_game_input) {
@@ -377,7 +380,6 @@ static void gamepad_poll_events(int apply_game_input) {
                 if (b & 0x1000) input.b1 = 1;
                 if (b & 0x2000) input.b2 = 1;
                 if (b & 0x4000) { input.b1 = 1; input.b2 = 1; }
-                if (b & 0x0010) { input.b1 = 1; input.b2 = 1; }
                 if (b & 0x8000) input.b2 = 1;
             }
         }
@@ -950,7 +952,7 @@ int host_run_launcher(const char *exe_dir, char *img_out, size_t n, int has_img)
 
         gui_fill_rect(0, GUI_H - 36, GUI_W, 36, 0xFF182438u);
         gui_draw_text(28, GUI_H - 22, 1, 0xFFB8C8E0u,
-                      "GAMEPAD / KEYBOARD: D-PAD + [A/ENTER] SELECT  |  IN-GAME MENU: [SELECT / VIEW] OR [F1]");
+                      "QUICK MENU: [START / MENU] OR [F1]  |  CD-I PAUSE: [SELECT / VIEW] OR [P]");
 
         present_raw(gui_fb, GUI_W, GUI_H);
         host_sleep_until(host_time() + 1.0 / 60.0);
@@ -993,7 +995,8 @@ static void run_ingame_overlay(const uint32_t *game_fb, int gw, int gh) {
         OM_COUNT
     };
     int sel = OM_RESUME;
-    char status_msg[96] = "GAME PAUSED - QUICK MENU";
+    char status_msg[128];
+    snprintf(status_msg, sizeof status_msg, "SAVES: %.110s", g_data_dir);
 
     set_cursor_visible(1);
     gui_nav_up = gui_nav_down = gui_nav_left = gui_nav_right = gui_nav_ok = gui_nav_back = 0;
@@ -1103,7 +1106,7 @@ static void run_ingame_overlay(const uint32_t *game_fb, int gw, int gh) {
         char labels[OM_COUNT][48];
         char values[OM_COUNT][64];
         snprintf(labels[OM_RESUME], 48, ">> RESUME GAME");
-        snprintf(values[OM_RESUME], 64, "[A / B / SELECT / F1]");
+        snprintf(values[OM_RESUME], 64, "[A / B / START / F1]");
         snprintf(labels[OM_SAVE], 48, "QUICKSAVE TO CURRENT SLOT (F2 / LB)");
         snprintf(values[OM_SAVE], 64, "SLOT %d", slot);
         snprintf(labels[OM_LOAD], 48, "QUICKLOAD FROM CURRENT SLOT (F4 / RB)");
@@ -1140,7 +1143,7 @@ static void run_ingame_overlay(const uint32_t *game_fb, int gw, int gh) {
         }
 
         gui_draw_text(68, GUI_H - 38, 1, 0xFF98B0D0u,
-                      "D-PAD/ARROWS: SELECT   [A/ENTER/LEFT/RIGHT]: CHANGE   [B/SELECT/F1]: RESUME");
+                      "D-PAD/ARROWS: SELECT   [A/ENTER/LEFT/RIGHT]: CHANGE   [B/START/F1]: RESUME");
 
         present_raw(gui_fb, GUI_W, GUI_H);
         host_sleep_until(host_time() + 1.0 / 60.0);
@@ -1159,6 +1162,124 @@ void host_status_banner(const char *title, const char *subtitle) {
     gui_draw_text(84, 212, 2, 0xFFFFE070u, title ? title : "");
     gui_draw_text(84, 248, 1, 0xFFD0D8E8u, subtitle ? subtitle : "");
     present_raw(gui_fb, GUI_W, GUI_H);
+}
+
+/* Interactive Compiler Selection Screen when no system C compiler is installed
+   on Windows.  Returns:
+     1 = Download portable Zig/Clang C compiler into saves/derived/compiler/ & compile
+     0 = Use built-in 68000 engine */
+int host_choose_compiler(const char *exe_dir) {
+    if (g_headless) return 0;
+    char mode[32] = "";
+    ini_get_str(exe_dir, "compiler_mode", mode, sizeof mode);
+    if (!_stricmp(mode, "interp") || !_stricmp(mode, "builtin")) return 0;
+    if (!_stricmp(mode, "download") || !_stricmp(mode, "zig")) return 1;
+
+    if (!host_inited) host_init();
+    if (!hwnd) return 0;
+    if (!gui_fb) gui_fb = (uint32_t *)calloc(GUI_W * GUI_H, 4);
+
+    enum {
+        CM_DOWNLOAD = 0,
+        CM_BUILTIN_ONCE = 1,
+        CM_BUILTIN_ALWAYS = 2,
+        CM_COUNT = 3
+    };
+    int sel = CM_DOWNLOAD;
+    int choice = 0;
+
+    set_cursor_visible(1);
+    gui_open = 1;
+    gui_nav_up = gui_nav_down = gui_nav_left = gui_nav_right = gui_nav_ok = gui_nav_back = 0;
+    mouse_clicked = 0;
+
+    while (!input.quit) {
+        pump_win32_messages();
+        gamepad_poll_events(0);
+
+        if (gui_nav_up) { sel = (sel - 1 + CM_COUNT) % CM_COUNT; gui_nav_up = 0; }
+        if (gui_nav_down) { sel = (sel + 1) % CM_COUNT; gui_nav_down = 0; }
+        if (gui_nav_back) { gui_nav_back = 0; choice = 0; break; }
+
+        int gx, gy;
+        gui_mouse_coords(&gx, &gy);
+        if (mouse_clicked) {
+            mouse_clicked = 0;
+            for (int i = 0; i < CM_COUNT; i++) {
+                int ry = 215 + i * 54;
+                if (gx >= 48 && gx <= GUI_W - 48 && gy >= ry && gy < ry + 44) {
+                    sel = i;
+                    gui_nav_ok = 1;
+                    break;
+                }
+            }
+        }
+
+        if (gui_nav_ok) {
+            gui_nav_ok = 0;
+            if (sel == CM_DOWNLOAD) {
+                choice = 1;
+            } else if (sel == CM_BUILTIN_ONCE) {
+                choice = 0;
+            } else if (sel == CM_BUILTIN_ALWAYS) {
+                ini_set_str(exe_dir, "compiler_mode", "interp");
+                choice = 0;
+            }
+            break;
+        }
+
+        gui_fill_rect(0, 0, GUI_W, GUI_H, 0xFF0E1420u);
+        gui_fill_rect(0, 0, GUI_W, 60, 0xFF182438u);
+        gui_draw_text(28, 12, 2, 0xFFFFE070u, "NO SYSTEM C COMPILER FOUND");
+        gui_draw_text(28, 38, 1, 0xFF88B0E8u, "CHOOSE HOW TO RUN THE DERIVED 68000 GAME CODE");
+
+        gui_fill_rect(48, 78, GUI_W - 96, 115, 0xFF141E30u);
+        gui_border_rect(48, 78, GUI_W - 96, 115, 1, 0xFF3A5888u);
+        gui_draw_text(64, 92, 1, 0xFFD8E4F8u,
+                      "THE 68000 MODULES FROM YOUR DISC WERE TRANSLATED TO C IN SAVES/DERIVED/GEN/.");
+        gui_draw_text(64, 112, 1, 0xFFD8E4F8u,
+                      "NO SYSTEM C COMPILER (GCC / CLANG) WAS DETECTED ON THIS DEVICE.");
+        gui_draw_text(64, 138, 1, 0xFF80F0A8u,
+                      "* OPTION 1: DOWNLOAD A PORTABLE C COMPILER (ZIG/CLANG) INTO SAVES/DERIVED/COMPILER/");
+        gui_draw_text(64, 156, 1, 0xFF80F0A8u,
+                      "  AND COMPILE NATIVE X64 CODE (RECOMP_USER.DLL) ON THE FLY (~45 MB, ONE-TIME).");
+        gui_draw_text(64, 174, 1, 0xFFB8C8E0u,
+                      "* OPTION 2/3: RUN IMMEDIATELY WITH THE BUILT-IN 68000 ENGINE (NO DOWNLOAD NEEDED).");
+
+        const char *titles[CM_COUNT] = {
+            ">> DOWNLOAD PORTABLE C COMPILER & BUILD NATIVE CODE (RECOMMENDED)",
+            ">> USE BUILT-IN 68000 ENGINE (PLAY IMMEDIATELY, ASK NEXT TIME)",
+            ">> ALWAYS USE BUILT-IN 68000 ENGINE (PLAY IMMEDIATELY, DON'T ASK AGAIN)"
+        };
+        const char *subs[CM_COUNT] = {
+            "DOWNLOADS PORTABLE ZIG CC TO SAVES/DERIVED/COMPILER/ & BUILDS RECOMP_USER.DLL",
+            "STARTS THE GAME RIGHT NOW WITHOUT DOWNLOADING ANYTHING",
+            "SAVES COMPILER_MODE=INTERP IN APPRENTICE.INI FOR FUTURE LAUNCHES"
+        };
+
+        for (int i = 0; i < CM_COUNT; i++) {
+            int ry = 215 + i * 54;
+            int is_sel = (i == sel);
+            uint32_t bg = is_sel ? 0xFF284A78u : (i == CM_DOWNLOAD ? 0xFF1A3228u : 0xFF162236u);
+            gui_fill_rect(48, ry, GUI_W - 96, 44, bg);
+            if (is_sel) gui_border_rect(48, ry, GUI_W - 96, 44, 2, 0xFFFFE070u);
+            uint32_t tcol = is_sel ? 0xFFFFE070u : (i == CM_DOWNLOAD ? 0xFF80FFB0u : 0xFFFFFFFFu);
+            gui_draw_text(64, ry + 10, 1, tcol, titles[i]);
+            gui_draw_text(64, ry + 26, 1, 0xFFB0C4E0u, subs[i]);
+        }
+
+        gui_fill_rect(0, GUI_H - 36, GUI_W, 36, 0xFF182438u);
+        gui_draw_text(28, GUI_H - 22, 1, 0xFFB8C8E0u,
+                      "D-PAD / ARROWS: SELECT OPTION   |   [A / ENTER]: CONFIRM   |   [B / ESC]: BUILT-IN ENGINE");
+
+        present_raw(gui_fb, GUI_W, GUI_H);
+        host_sleep_until(host_time() + 1.0 / 60.0);
+    }
+
+    gui_open = 0;
+    memset(keys, 0, sizeof keys);
+    set_cursor_visible(0);
+    return choice;
 }
 
 /* ---------------------------------------------------------------- Frame Dump & Presentation */
@@ -1230,8 +1351,8 @@ void host_present(const uint32_t *fb, int w, int h) {
     double now = host_time();
     if (now < next_frame_time) {
         host_sleep_until(next_frame_time);
-    } else if (now - next_frame_time > 4.0 / FIELD_RATE) {
-        next_frame_time = now;
+    } else if (now - next_frame_time > 2.0 / FIELD_RATE) {
+        next_frame_time = now - 1.25 / FIELD_RATE;
     }
 }
 

@@ -2,7 +2,7 @@
   "title": "The Apprentice",
   "exe_name": "apprentice",
   "version": "1.0.0",
-  "update_repo": "",
+  "update_repo": "teriame/Repprentice",
   "tv": "ntsc",
   "invincibility": {"life_byte": "0x108c6d"},
   "modules": [

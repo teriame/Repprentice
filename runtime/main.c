@@ -190,6 +190,39 @@ int main(int argc, char **argv) {
               "(A .chd image can be selected directly in the launcher GUI or converted to .bin/.cue in saves/).");
     }
     LOG("disc image: %s", img);
+#ifndef _WIN32
+    /* When Steam launches an AppImage with APPIMAGE_EXTRACT_AND_RUN=1, Steam's
+       own extractor may unpack to /tmp/appimage_extracted_* and start AppRun
+       with CWD=/tmp/appimage_extracted_* and without APPIMAGE set.  In that
+       case, relocate exe_dir and saves/ next to the disc image (and chdir
+       there) so saves/ and recomp.log are persisted in the game folder instead
+       of vanishing when /tmp/appimage_extracted_* is cleaned up. */
+    if (!strncmp(g_data_dir, "/tmp/", 5) || !strcmp(exe_dir, ".") || access(g_data_dir, W_OK) != 0) {
+        char ddir[600];
+        snprintf(ddir, sizeof ddir, "%s", img);
+        char *sl = strrchr(ddir, '/');
+        if (sl) {
+            *sl = 0;
+            char *last = strrchr(ddir, '/');
+            if (last && (!strcasecmp(last + 1, "rom") || !strcasecmp(last + 1, "saves"))) *last = 0;
+            if (strncmp(ddir, "/tmp/", 5) != 0 && access(ddir, W_OK) == 0) {
+                snprintf(exe_dir, sizeof exe_dir, "%s", ddir);
+                if (chdir(exe_dir) == 0) {}
+                setup_data_dir();
+                ini_set("rom", img);
+                char lp[600];
+                snprintf(lp, sizeof lp, "%s/recomp.log", g_data_dir);
+                FILE *nlog = fopen(lp, "w");
+                if (nlog) {
+                    if (logfp) fclose(logfp);
+                    logfp = nlog;
+                    LOG("%s %s (exe_dir=%s, saves=%s)", GAME_TITLE, APP_VERSION, exe_dir, g_data_dir);
+                    LOG("disc image: %s", img);
+                }
+            }
+        }
+    }
+#endif
     if (disc_open(img)) fatal("failed to open disc image %s", img);
 
     RAM = (uint8_t *)calloc(MEM_SIZE + 16, 1);

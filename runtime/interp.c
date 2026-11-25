@@ -200,7 +200,7 @@ static void do_call(uint32_t t) {
         if (r != ret) { ipc = r; istop = 1; }
         return;
     }
-    ipc = t;
+    ipc = cpu_hook_cdi_pause(t, ret);
 }
 
 static void exec_one(void) {

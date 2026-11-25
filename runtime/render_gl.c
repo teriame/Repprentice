@@ -105,12 +105,13 @@ const char *render_aspect_name(int a) { return aspect_names[a % RENDER_ASPECTS];
 const char *render_filter_name(int f) { return filter_names[f % RENDER_FILTERS]; }
 
 static Display *rdpy;
+static int rdpy_owned;
 static Window rwin;
 static GLXContext rctx;
 static GLuint prog, tex, vao, vbo;
 static GLint u_rect, u_src, u_prm, u_uvx, u_up, u_tex;
 static int tex_w, tex_h, tex_mips;
-static int win_cw = 1280, win_ch = 800;
+static volatile int win_cw = 1280, win_ch = 800;
 static float cur_u0 = 0.0f, cur_v0 = 0.0f, cur_us = 1.0f, cur_vs = 1.0f;
 
 extern int frontend_get_upscaler(void);
@@ -464,7 +465,14 @@ int render_init_x11(void *dpy_ptr, unsigned long win_id) {
        can pace cleanly at FIELD_RATE without double-waiting on VSync. */
     setenv("vblank_mode", "0", 1);
     setenv("__GL_SYNC_TO_VBLANK", "0", 1);
-    rdpy = (Display *)dpy_ptr;
+    XSync((Display *)dpy_ptr, False);
+    rdpy = XOpenDisplay(NULL);
+    if (rdpy) {
+        rdpy_owned = 1;
+    } else {
+        rdpy = (Display *)dpy_ptr;
+        rdpy_owned = 0;
+    }
     rwin = (Window)win_id;
     XWindowAttributes wa;
     if (XGetWindowAttributes(rdpy, rwin, &wa)) {
@@ -557,11 +565,24 @@ int render_init_x11(void *dpy_ptr, unsigned long win_id) {
     return 0;
 }
 
+void render_bind_thread(void) {
+    if (rdpy && rctx) glXMakeCurrent(rdpy, rwin, rctx);
+}
+
+void render_unbind_thread(void) {
+    if (rdpy && rctx) glXMakeCurrent(rdpy, None, NULL);
+}
+
 void render_shutdown(void) {
     if (rdpy && rctx) {
         glXMakeCurrent(rdpy, None, NULL);
         glXDestroyContext(rdpy, rctx);
         rctx = NULL;
+    }
+    if (rdpy && rdpy_owned) {
+        XCloseDisplay(rdpy);
+        rdpy = NULL;
+        rdpy_owned = 0;
     }
 }
 

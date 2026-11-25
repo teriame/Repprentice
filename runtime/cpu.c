@@ -87,22 +87,77 @@ void runtime_cleanup_embedded_tools(const char *tool_dir) {
 #endif
 }
 
+/* Try to locate or download the portable Zig C compiler in <saves>/derived/compiler/
+   using tools/fetch_compiler.py.  When check_only == 1, only checks if it was
+   already downloaded. */
+static int find_or_fetch_portable_zig(const char *tool_dir, const char *comp_dir,
+                                      int check_only, char *zig_out, size_t n) {
+    char script[750], cmd[2000];
+    snprintf(script, sizeof script, "%s/tools/fetch_compiler.py", tool_dir);
+#ifdef _WIN32
+    const char *py_cmd = "python";
+    if (system("python --version >nul 2>&1") != 0 && system("py -3 --version >nul 2>&1") == 0)
+        py_cmd = "py -3";
+    snprintf(cmd, sizeof cmd, "%s \"%s\"%s \"%s\" 2>nul",
+             py_cmd, script, check_only ? " --check" : "", comp_dir);
+    FILE *p = _popen(cmd, "r");
+#else
+    snprintf(cmd, sizeof cmd, "python3 '%s'%s '%s' 2>/dev/null",
+             script, check_only ? " --check" : "", comp_dir);
+    FILE *p = popen(cmd, "r");
+#endif
+    if (!p) return -1;
+    char line[1024] = "";
+    if (fgets(line, sizeof line, p)) {
+        line[strcspn(line, "\r\n")] = 0;
+    }
+#ifdef _WIN32
+    int rc = _pclose(p);
+#else
+    int rc = pclose(p);
+#endif
+    if (rc != 0 || !line[0]) return -1;
+    snprintf(zig_out, n, "%s", line);
+    return 0;
+}
+
+static int compile_with_zig(const char *zig_bin, const char *comp_dir,
+                            const char *tool_dir, const char *gen_dir,
+                            const char *mod_path) {
+    char cache_dir[800];
+    snprintf(cache_dir, sizeof cache_dir, "%s/cache", comp_dir);
+    MKDIR(comp_dir);
+    MKDIR(cache_dir);
+    char cmd[3600];
+#ifdef _WIN32
+    snprintf(cmd, sizeof cmd,
+             "cmd /c \"set \"ZIG_GLOBAL_CACHE_DIR=%s\" && set \"ZIG_LOCAL_CACHE_DIR=%s\" && \"%s\" cc -shared -O2 -DRECOMP_PLUGIN_DLL -Wno-unused-label -I\"%s/runtime\" -I\"%s\" \"%s/runtime/alu.c\" \"%s\"/recomp_*.c -o \"%s\" >nul 2>&1\"",
+             cache_dir, cache_dir, zig_bin, tool_dir, gen_dir, tool_dir, gen_dir, mod_path);
+#else
+    snprintf(cmd, sizeof cmd,
+             "ZIG_GLOBAL_CACHE_DIR='%s' ZIG_LOCAL_CACHE_DIR='%s' '%s' cc -shared -fPIC -O2 -Wl,--allow-shlib-undefined -Wno-unused-label -I'%s/runtime' -I'%s' '%s'/recomp_*.c -o '%s.tmp' 2>/dev/null && mv -f '%s.tmp' '%s'",
+             cache_dir, cache_dir, zig_bin, tool_dir, gen_dir, gen_dir, mod_path, mod_path, mod_path);
+#endif
+    return system(cmd);
+}
+
 /* When a binary or AppImage is distributed without any derived game code
    (recomp_num_entries == 0), derive the 68000 -> C source files locally on the
    user's machine from their disc image into <saves>/derived/gen/, and if a C
-   compiler is available on the user's machine, compile and load
+   compiler is available on the user's machine (or downloaded on the fly via
+   the interactive compiler selection screen), compile and load
    <saves>/derived/recomp_user.so (or recomp_user.dll on Windows). */
 void cpu_derive_user_code(const char *exe_dir, const char *disc_bin_path) {
-    (void)exe_dir;
     active_entries = recomp_entries;
     active_num_entries = recomp_num_entries;
     active_names = recomp_names;
     active_num_names = recomp_num_names;
     if (active_num_entries > 0) return;
 
-    char derived_dir[700], gen_dir[750], table_c[800], mod_path[800];
+    char derived_dir[700], gen_dir[750], comp_dir[750], table_c[800], mod_path[800];
     snprintf(derived_dir, sizeof derived_dir, "%s/derived", g_data_dir);
     snprintf(gen_dir, sizeof gen_dir, "%s/gen", derived_dir);
+    snprintf(comp_dir, sizeof comp_dir, "%s/compiler", derived_dir);
     snprintf(table_c, sizeof table_c, "%s/recomp_table.c", gen_dir);
 #ifdef _WIN32
     snprintf(mod_path, sizeof mod_path, "%s/recomp_user.dll", derived_dir);
@@ -113,6 +168,7 @@ void cpu_derive_user_code(const char *exe_dir, const char *disc_bin_path) {
 
     extern int g_headless;
     extern void host_status_banner(const char *title, const char *subtitle);
+    extern int host_choose_compiler(const char *exe_dir);
 
     char tool_dir[600] = "";
     char gen_py[700] = "";
@@ -150,47 +206,111 @@ void cpu_derive_user_code(const char *exe_dir, const char *disc_bin_path) {
         if (tf) fclose(tf);
     }
 
-    /* Step 2: Compile derived C code to a shared module if a C compiler is available */
+    /* Step 2: Compile derived C code to a shared module if a C compiler is available
+       (or offer to download a portable C compiler into saves/derived/compiler/) */
     if (!have_mod && have_table && tool_dir[0]) {
-#ifdef _WIN32
-        const char *cc_bin = NULL;
-        if (system("where gcc >nul 2>&1") == 0) cc_bin = "gcc";
-        else if (system("where clang >nul 2>&1") == 0) cc_bin = "clang";
-        if (cc_bin) {
-            LOG("compiling user-derived C code with %s -> %s ...", cc_bin, mod_path);
-            if (!g_headless)
-                host_status_banner("COMPILING DERIVED C CODE FOR YOUR MACHINE...",
-                                   "BUILDING NATIVE MODULE SAVES/DERIVED/RECOMP_USER.DLL");
-            char cmd[2600];
-            snprintf(cmd, sizeof cmd,
-                     "%s -shared -O2 -Wno-unused-label -I\"%s/runtime\" -I\"%s\" \"%s\"/recomp_*.c -o \"%s\" >nul 2>&1",
-                     cc_bin, tool_dir, gen_dir, gen_dir, mod_path);
-            int rc = system(cmd);
-            if (rc != 0) LOG("compiling user-derived C code failed (%d); using built-in 68000 engine", rc);
-        } else {
-            LOG("no C compiler found on host; derived C sources are in %s (running with built-in 68000 engine)", gen_dir);
-        }
-#else
-        const char *cc_bin = NULL;
-        if (system("command -v cc >/dev/null 2>&1") == 0) cc_bin = "cc";
-        else if (system("command -v gcc >/dev/null 2>&1") == 0) cc_bin = "gcc";
-        else if (system("command -v clang >/dev/null 2>&1") == 0) cc_bin = "clang";
+        int compiled_ok = 0;
+        char zig_bin[1024] = "";
 
-        if (cc_bin) {
-            LOG("compiling user-derived C code with %s -> %s ...", cc_bin, mod_path);
+        /* 2a. Check if portable Zig compiler was already downloaded into saves/derived/compiler/ */
+        if (find_or_fetch_portable_zig(tool_dir, comp_dir, 1, zig_bin, sizeof zig_bin) == 0) {
+            LOG("compiling user-derived C code with portable Zig (%s) -> %s ...", zig_bin, mod_path);
             if (!g_headless)
                 host_status_banner("COMPILING DERIVED C CODE FOR YOUR MACHINE...",
-                                   "BUILDING NATIVE SHARED MODULE SAVES/DERIVED/RECOMP_USER.SO");
-            char cmd[2600];
-            snprintf(cmd, sizeof cmd,
-                     "'%s' -shared -fPIC -O2 -Wno-unused-label -I'%s/runtime' -I'%s' '%s'/recomp_*.c -o '%s.tmp' 2>/dev/null && mv -f '%s.tmp' '%s'",
-                     cc_bin, tool_dir, gen_dir, gen_dir, mod_path, mod_path, mod_path);
-            int rc = system(cmd);
-            if (rc != 0) LOG("compiling user-derived C code failed (%d); using built-in 68000 engine", rc);
-        } else {
+                                   "BUILDING NATIVE MODULE WITH PORTABLE ZIG CC...");
+            if (compile_with_zig(zig_bin, comp_dir, tool_dir, gen_dir, mod_path) == 0) {
+                compiled_ok = 1;
+            }
+        }
+
+        /* 2b. Check for a working system C compiler on PATH */
+        if (!compiled_ok) {
+#ifdef _WIN32
+            const char *cc_bin = NULL;
+            int is_sys_zig = 0;
+            if (system("where zig >nul 2>&1") == 0) { cc_bin = "zig"; is_sys_zig = 1; }
+            else if (system("where gcc >nul 2>&1") == 0) cc_bin = "gcc";
+            else if (system("where clang >nul 2>&1") == 0) cc_bin = "clang";
+            if (cc_bin) {
+                LOG("compiling user-derived C code with system %s -> %s ...", cc_bin, mod_path);
+                if (!g_headless)
+                    host_status_banner("COMPILING DERIVED C CODE FOR YOUR MACHINE...",
+                                       "BUILDING NATIVE MODULE SAVES/DERIVED/RECOMP_USER.DLL");
+                int rc;
+                if (is_sys_zig) {
+                    rc = compile_with_zig(cc_bin, comp_dir, tool_dir, gen_dir, mod_path);
+                } else {
+                    char cmd[2800];
+                    snprintf(cmd, sizeof cmd,
+                             "%s -shared -O2 -DRECOMP_PLUGIN_DLL -Wno-unused-label -I\"%s/runtime\" -I\"%s\" \"%s/runtime/alu.c\" \"%s\"/recomp_*.c -o \"%s\" >nul 2>&1",
+                             cc_bin, tool_dir, gen_dir, tool_dir, gen_dir, mod_path);
+                    rc = system(cmd);
+                }
+                if (rc == 0) compiled_ok = 1;
+                else LOG("system compiler %s failed (%d)", cc_bin, rc);
+            }
+#else
+            const char *cc_bin = NULL;
+            int is_sys_zig = 0;
+            if (system("command -v cc >/dev/null 2>&1") == 0) cc_bin = "cc";
+            else if (system("command -v gcc >/dev/null 2>&1") == 0) cc_bin = "gcc";
+            else if (system("command -v clang >/dev/null 2>&1") == 0) cc_bin = "clang";
+            else if (system("command -v zig >/dev/null 2>&1") == 0) { cc_bin = "zig"; is_sys_zig = 1; }
+
+            if (cc_bin) {
+                LOG("compiling user-derived C code with system %s -> %s ...", cc_bin, mod_path);
+                if (!g_headless)
+                    host_status_banner("COMPILING DERIVED C CODE FOR YOUR MACHINE...",
+                                       "BUILDING NATIVE SHARED MODULE SAVES/DERIVED/RECOMP_USER.SO");
+                int rc;
+                if (is_sys_zig) {
+                    rc = compile_with_zig(cc_bin, comp_dir, tool_dir, gen_dir, mod_path);
+                } else {
+                    char cmd[2600];
+                    snprintf(cmd, sizeof cmd,
+                             "'%s' -shared -fPIC -O2 -Wno-unused-label -I'%s/runtime' -I'%s' '%s'/recomp_*.c -o '%s.tmp' 2>/dev/null && mv -f '%s.tmp' '%s'",
+                             cc_bin, tool_dir, gen_dir, gen_dir, mod_path, mod_path, mod_path);
+                    rc = system(cmd);
+                }
+                if (rc == 0) compiled_ok = 1;
+                else LOG("system compiler %s failed (%d)", cc_bin, rc);
+            }
+#endif
+        }
+
+        /* 2c. No working C compiler found on host: show interactive selection screen
+               to download a portable C compiler (Zig/Clang) or use the built-in 68000 engine */
+        if (!compiled_ok && !g_headless) {
+            int want_download = host_choose_compiler(exe_dir);
+            if (want_download == 1) {
+                LOG("downloading portable Zig C compiler into %s ...", comp_dir);
+                host_status_banner("DOWNLOADING PORTABLE C COMPILER (ZIG CC)...",
+                                   "DOWNLOADING TO SAVES/DERIVED/COMPILER/ (ONE-TIME, ~45 MB)...");
+                if (find_or_fetch_portable_zig(tool_dir, comp_dir, 0, zig_bin, sizeof zig_bin) == 0) {
+                    LOG("portable Zig C compiler ready at %s; compiling %s ...", zig_bin, mod_path);
+                    host_status_banner("COMPILING DERIVED C CODE FOR YOUR MACHINE...",
+                                       "BUILDING NATIVE MODULE WITH PORTABLE ZIG CC (10-20 SECONDS)...");
+                    int rc = compile_with_zig(zig_bin, comp_dir, tool_dir, gen_dir, mod_path);
+                    if (rc == 0) {
+                        compiled_ok = 1;
+                    } else {
+                        LOG("portable Zig compilation failed (%d); falling back to built-in 68000 engine", rc);
+                        host_status_banner("COMPILATION FAILED - USING BUILT-IN 68000 ENGINE",
+                                           "STARTING GAME WITH BUILT-IN 68000 ENGINE...");
+                        host_sleep_until(host_time() + 1.5);
+                    }
+                } else {
+                    LOG("portable Zig download failed; falling back to built-in 68000 engine");
+                    host_status_banner("COMPILER DOWNLOAD FAILED (CHECK INTERNET CONNECTION)",
+                                       "STARTING GAME WITH BUILT-IN 68000 ENGINE...");
+                    host_sleep_until(host_time() + 1.5);
+                }
+            } else {
+                LOG("user selected built-in 68000 engine (derived C sources are in %s)", gen_dir);
+            }
+        } else if (!compiled_ok) {
             LOG("no C compiler found on host; derived C sources are in %s (running with built-in 68000 engine)", gen_dir);
         }
-#endif
     }
 
     if (tool_dir[0]) runtime_cleanup_embedded_tools(tool_dir);
@@ -202,6 +322,16 @@ void cpu_derive_user_code(const char *exe_dir, const char *disc_bin_path) {
 #ifdef _WIN32
         HMODULE dl = LoadLibraryA(mod_path);
         if (dl) {
+            typedef void (*PluginInitFn)(const RecompHostAPI *);
+            PluginInitFn pinit = (PluginInitFn)GetProcAddress(dl, "recomp_plugin_init");
+            if (pinit) {
+                static const RecompHostAPI api = {
+                    &m68k, &RAM, &jt_expected,
+                    recomp_bad_entry, m68k_call, m68k_exception,
+                    m68k_trap, os9_syscall, jt_check
+                };
+                pinit(&api);
+            }
             const RecompEntry *ent = (const RecompEntry *)GetProcAddress(dl, "recomp_entries");
             const int *nent = (const int *)GetProcAddress(dl, "recomp_num_entries");
             const RecompName *nam = (const RecompName *)GetProcAddress(dl, "recomp_names");
@@ -338,9 +468,38 @@ uint32_t recomp_bad_entry(uint32_t pc, uint32_t func) {
 
 uint32_t interp_run(uint32_t pc);
 
+int g_cdi_pause_req;
+
+uint32_t cpu_hook_cdi_pause(uint32_t target, uint32_t ret_pc) {
+    /* When the user presses Select / View (⧉) in-game, trigger the original
+       CD-i built-in pause screen via the level module's pause-check entry
+       116(a5) (or confirm/unpause via 112(a5) if already paused) without
+       requiring a 50-frame Button 1+2 hold that makes Marvin jump. */
+    if (g_cdi_pause_req > 0 && !g_audio_muted && target == A(5) + 116) {
+        if (RW(target) == 0x6000) {
+            uint32_t fn = target + 2 + (int16_t)RW(target + 2);
+            if (RW(fn) == 0x343A && RW(fn + 4) == 0x263A && RW(fn + 8) == 0x41FA) {
+                uint32_t addr_d3 = fn + 6 + (int16_t)RW(fn + 6);
+                uint32_t addr_a0 = fn + 10 + (int16_t)RW(fn + 10);
+                if (ret_pc != 0x109fd6u) {
+                    D(2) = (D(2) & 0xFFFF0000u) | 0x8000u;
+                    D(3) = 0x00008003u;
+                    WW(addr_a0 + 12, 0x0031);
+                    g_cdi_pause_req = 0;
+                    return fn + 8;
+                } else {
+                    WL(addr_d3, 0x00008001u);
+                    g_cdi_pause_req = 0;
+                }
+            }
+        }
+    }
+    return target;
+}
+
 uint32_t m68k_call(uint32_t target) {
     extern int g_interp_all;
-    uint32_t pc = target;
+    uint32_t pc = cpu_hook_cdi_pause(target, RL(A(7)));
     if (g_interp_all) return interp_run(pc);
     RecompFn f = lookup(&pc);
     if (!f) {

@@ -297,18 +297,20 @@ static void gamepad_read_events(void) {
     js_prev_dpad_y = dy;
     js_prev_dpad_x = dx;
 
-    /* Button 6 (Select / View on Steam Deck) or Button 8 (Guide / Mode): toggle GUI overlay */
-    if ((js_btns[6] && !js_prev_btns[6]) || (js_btns[8] && !js_prev_btns[8])) {
+    /* Button 7 (Burger / Start / Menu on Steam Deck) or Button 8 (Guide / Mode): toggle Quick Menu overlay */
+    if ((js_btns[7] && !js_prev_btns[7]) || (js_btns[8] && !js_prev_btns[8])) {
         gui_open = !gui_open;
     }
     if (gui_open) {
-        /* A (btn 0) or Start (btn 7): Confirm / Activate */
-        if ((js_btns[0] && !js_prev_btns[0]) || (js_btns[7] && !js_prev_btns[7])) gui_nav_ok = 1;
-        /* B (btn 1): Back / Close menu */
-        if (js_btns[1] && !js_prev_btns[1]) gui_nav_back = 1;
+        /* A (btn 0): Confirm / Activate */
+        if (js_btns[0] && !js_prev_btns[0]) gui_nav_ok = 1;
+        /* B (btn 1) or Select/View (btn 6): Back / Close menu */
+        if ((js_btns[1] && !js_prev_btns[1]) || (js_btns[6] && !js_prev_btns[6])) gui_nav_back = 1;
         /* X (btn 2) or Y (btn 3): Tab / Cycle */
         if ((js_btns[2] && !js_prev_btns[2]) || (js_btns[3] && !js_prev_btns[3])) gui_nav_tab = 1;
     } else {
+        /* Button 6 (Select / View ⧉ on Steam Deck): trigger original CD-i in-game pause screen */
+        if (js_btns[6] && !js_prev_btns[6]) g_cdi_pause_req = 4;
         /* In-game controller shortcuts: L1 (btn 4) = Quicksave, R1 (btn 5) = Quickload */
         if (js_btns[4] && !js_prev_btns[4]) push_hotkey(HOTKEY_SAVE);
         if (js_btns[5] && !js_prev_btns[5]) push_hotkey(HOTKEY_LOAD);
@@ -327,13 +329,113 @@ static void gamepad_apply_game_input(void) {
     if (js_axes[6] >  16000 || js_btns[12]) input.dx += 6;
     if (js_axes[7] < -16000 || js_btns[13]) input.dy -= 6;
     if (js_axes[7] >  16000 || js_btns[14]) input.dy += 6;
-    /* Standard gamepad buttons: 0=A, 1=B, 2=X, 3=Y, 7=Start */
+    /* Standard gamepad buttons: 0=A (Button 1), 1=B / 3=Y (Button 2), 2=X (Button 1+2) */
     if (js_btns[0]) input.b1 = 1;
     if (js_btns[1] || js_btns[3]) input.b2 = 1;
-    if (js_btns[2] || js_btns[7]) { input.b1 = 1; input.b2 = 1; }
+    if (js_btns[2]) { input.b1 = 1; input.b2 = 1; }
 }
 
 /* ---------------------------------------------------------------- X11 Window & Presentation */
+extern void render_bind_thread(void);
+extern void render_unbind_thread(void);
+
+/* Dedicated OpenGL presenter thread so external compositor frame limiters
+   (e.g. Steam Deck Gamescope 45 / 40 / 30 / 24 / 15 FPS caps) block only the
+   presenter thread inside glXSwapBuffers while the 60.0 Hz CD-i emulation and
+   44.1 kHz audio continue running at an uninterrupted, exact 16.67 ms tick. */
+static pthread_t pres_thread;
+static int pres_thread_started;
+static pthread_mutex_t pres_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pres_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t pres_ack_cv = PTHREAD_COND_INITIALIZER;
+static uint32_t *pres_staging;
+static size_t pres_cap;
+static int pres_w, pres_h;
+static uint64_t pres_seq, pres_done_seq;
+static int pres_quit;
+static double pres_swap_sum;
+static int pres_swap_count;
+static int pres_last_hw_vsync;
+static double pres_last_swap_done;
+static double pres_vblank_dt = 1.0 / FIELD_RATE;
+
+static void *presenter_thread_fn(void *arg) {
+    (void)arg;
+    render_bind_thread();
+    uint32_t *local_buf = NULL;
+    size_t local_cap = 0;
+    uint64_t rendered_seq = 0;
+    double prev_swap_done = -1.0;
+    double ema_vblank_dt = 1.0 / FIELD_RATE;
+
+    pthread_mutex_lock(&pres_mtx);
+    while (!pres_quit) {
+        while (!pres_quit && pres_seq <= rendered_seq) {
+            pthread_cond_wait(&pres_cv, &pres_mtx);
+        }
+        if (pres_quit) break;
+
+        /* When an external <=30 FPS limiter is active (ema_vblank_dt >= 29 ms)
+           during 60 Hz gameplay (pres_h == 240), at least 2 simulation fields
+           elapse per display refresh.  If glXSwapBuffers woke up slightly
+           before the 2nd field finished (pres_seq == rendered_seq + 1), wait
+           up to 6 ms for the 2nd field so 30 FPS locks strictly onto every
+           2nd field (2, 4, 6, 8...) without +1/+3 phase slip. */
+        if (ema_vblank_dt >= 0.029 && pres_h == 240 && pres_seq == rendered_seq + 1) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 6000000L; /* 6 ms */
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            while (!pres_quit && pres_seq < rendered_seq + 2) {
+                if (pthread_cond_timedwait(&pres_cv, &pres_mtx, &ts) == ETIMEDOUT)
+                    break;
+            }
+            if (pres_quit) break;
+        }
+
+        int w = pres_w, h = pres_h;
+        size_t need = (size_t)w * (size_t)h;
+        uint64_t seq = pres_seq;
+        if (need > local_cap) {
+            free(local_buf);
+            local_buf = (uint32_t *)malloc(need * 4);
+            local_cap = need;
+        }
+        if (local_buf && pres_staging) {
+            memcpy(local_buf, pres_staging, need * 4);
+        }
+        pthread_mutex_unlock(&pres_mtx);
+
+        double t0 = host_time();
+        if (local_buf) render_present(local_buf, w, h);
+        double t1 = host_time();
+        double swap_dt = t1 - t0;
+        if (prev_swap_done > 0.0) {
+            double vdt = t1 - prev_swap_done;
+            if (vdt > 0.005 && vdt < 0.250)
+                ema_vblank_dt = ema_vblank_dt * 0.7 + vdt * 0.3;
+        }
+        prev_swap_done = t1;
+
+        pthread_mutex_lock(&pres_mtx);
+        rendered_seq = seq;
+        pres_done_seq = seq;
+        pres_swap_sum += swap_dt;
+        pres_swap_count++;
+        pres_last_hw_vsync = (swap_dt >= 0.004);
+        pres_last_swap_done = t1;
+        pres_vblank_dt = ema_vblank_dt;
+        pthread_cond_broadcast(&pres_ack_cv);
+    }
+    pthread_mutex_unlock(&pres_mtx);
+    render_unbind_thread();
+    free(local_buf);
+    return NULL;
+}
+
 int host_init(void) {
     host_time();
     if (g_headless) return 0;
@@ -342,6 +444,7 @@ int host_init(void) {
         return 0;
     }
     host_inited = 1;
+    XInitThreads();
     in_gamescope = (getenv("STEAM_GAMEPADUI") != NULL ||
                     getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL ||
                     getenv("SteamDeck") != NULL ||
@@ -433,6 +536,14 @@ int host_init(void) {
     XFreePixmap(dpy, bm);
 
     if (use_gpu) gpu_ok = (render_init_x11(dpy, win) == 0);
+    if (gpu_ok && !pres_thread_started) {
+        render_unbind_thread();
+        if (pthread_create(&pres_thread, NULL, presenter_thread_fn, NULL) == 0) {
+            pres_thread_started = 1;
+        } else {
+            render_bind_thread();
+        }
+    }
     if (start_fullscreen) {
         /* Also send the EWMH ClientMessage for window managers that require it after map */
         fullscreen = 0;
@@ -470,14 +581,41 @@ static void sw_present(const uint32_t *fb, int w, int h) {
     XFlush(dpy);
 }
 
-static void present_raw(const uint32_t *fb, int w, int h) {
+static void present_raw_sync(const uint32_t *fb, int w, int h, int wait_ack) {
     if (g_headless || !dpy || !win) return;
+    if (gpu_ok && pres_thread_started) {
+        size_t need = (size_t)w * (size_t)h;
+        pthread_mutex_lock(&pres_mtx);
+        if (need > pres_cap) {
+            free(pres_staging);
+            pres_staging = (uint32_t *)malloc(need * 4);
+            pres_cap = need;
+        }
+        if (pres_staging) {
+            memcpy(pres_staging, fb, need * 4);
+            pres_w = w;
+            pres_h = h;
+            uint64_t seq = ++pres_seq;
+            pthread_cond_signal(&pres_cv);
+            if (wait_ack) {
+                while (!pres_quit && pres_done_seq < seq) {
+                    pthread_cond_wait(&pres_ack_cv, &pres_mtx);
+                }
+            }
+        }
+        pthread_mutex_unlock(&pres_mtx);
+        return;
+    }
     if (gpu_ok && render_present(fb, w, h) != 0) {
         LOG("GPU present failed; falling back to X11 software output");
         gpu_ok = 0;
         update_title();
     }
     if (!gpu_ok) sw_present(fb, w, h);
+}
+
+static void present_raw(const uint32_t *fb, int w, int h) {
+    present_raw_sync(fb, w, h, 0);
 }
 
 static void pump_x11_events(void) {
@@ -530,6 +668,7 @@ static void pump_x11_events(void) {
             } else {
                 if (ks == XK_Escape) input.quit = 1;
                 if (!was_down) {
+                    if (ks == XK_p || ks == XK_P || ks == XK_Pause) g_cdi_pause_req = 4;
                     if (ks == XK_F2) push_hotkey(HOTKEY_SAVE);
                     if (ks == XK_F3) push_hotkey(HOTKEY_SLOT);
                     if (ks == XK_F4) push_hotkey(HOTKEY_LOAD);
@@ -1217,7 +1356,7 @@ int host_run_launcher(const char *exe_dir, char *img_out, size_t n, int has_img)
 
         gui_fill_rect(0, GUI_H - 36, GUI_W, 36, 0xFF182438u);
         gui_draw_text(28, GUI_H - 22, 1, 0xFFB8C8E0u,
-                      "STEAM DECK / GAMEPAD: D-PAD + [A] SELECT  |  IN-GAME MENU: [SELECT / VIEW] OR [F1]");
+                      "QUICK MENU: [START / BURGER] OR [F1]  |  CD-I PAUSE: [SELECT / VIEW] OR [P]");
 
         present_raw(gui_fb, GUI_W, GUI_H);
         host_sleep_until(host_time() + 1.0 / 60.0);
@@ -1261,7 +1400,8 @@ static void run_ingame_overlay(const uint32_t *game_fb, int gw, int gh) {
         OM_COUNT
     };
     int sel = OM_RESUME;
-    char status_msg[96] = "GAME PAUSED - STEAM DECK & LINUX QUICK MENU";
+    char status_msg[128];
+    snprintf(status_msg, sizeof status_msg, "SAVES: %.110s", g_data_dir);
 
     set_cursor_visible(1);
     gui_nav_up = gui_nav_down = gui_nav_left = gui_nav_right = gui_nav_ok = gui_nav_back = 0;
@@ -1371,7 +1511,7 @@ static void run_ingame_overlay(const uint32_t *game_fb, int gw, int gh) {
         char labels[OM_COUNT][48];
         char values[OM_COUNT][64];
         snprintf(labels[OM_RESUME], 48, ">> RESUME GAME");
-        snprintf(values[OM_RESUME], 64, "[A / B / SELECT / F1]");
+        snprintf(values[OM_RESUME], 64, "[A / B / START / F1]");
         snprintf(labels[OM_SAVE], 48, "QUICKSAVE TO CURRENT SLOT (F2 / L1)");
         snprintf(values[OM_SAVE], 64, "SLOT %d", slot);
         snprintf(labels[OM_LOAD], 48, "QUICKLOAD FROM CURRENT SLOT (F4 / R1)");
@@ -1408,7 +1548,7 @@ static void run_ingame_overlay(const uint32_t *game_fb, int gw, int gh) {
         }
 
         gui_draw_text(68, GUI_H - 38, 1, 0xFF98B0D0u,
-                      "D-PAD/ARROWS: SELECT   [A/ENTER/LEFT/RIGHT]: CHANGE   [B/SELECT/F1]: RESUME");
+                      "D-PAD/ARROWS: SELECT   [A/ENTER/LEFT/RIGHT]: CHANGE   [B/START/F1]: RESUME");
 
         present_raw(gui_fb, GUI_W, GUI_H);
         host_sleep_until(host_time() + 1.0 / 60.0);
@@ -1426,7 +1566,125 @@ void host_status_banner(const char *title, const char *subtitle) {
     gui_border_rect(60, 180, GUI_W - 120, 120, 2, 0xFF50A0FFu);
     gui_draw_text(84, 212, 2, 0xFFFFE070u, title ? title : "");
     gui_draw_text(84, 248, 1, 0xFFD0D8E8u, subtitle ? subtitle : "");
-    present_raw(gui_fb, GUI_W, GUI_H);
+    present_raw_sync(gui_fb, GUI_W, GUI_H, 1);
+}
+
+/* Interactive Compiler Selection Screen when no system C compiler is installed
+   on the host (e.g. SteamOS / Steam Deck).  Returns:
+     1 = Download portable Zig/Clang C compiler into saves/derived/compiler/ & compile
+     0 = Use built-in 68000 engine */
+int host_choose_compiler(const char *exe_dir) {
+    if (g_headless) return 0;
+    char mode[32] = "";
+    ini_get_str(exe_dir, "compiler_mode", mode, sizeof mode);
+    if (!strcasecmp(mode, "interp") || !strcasecmp(mode, "builtin")) return 0;
+    if (!strcasecmp(mode, "download") || !strcasecmp(mode, "zig")) return 1;
+
+    if (!host_inited) host_init();
+    if (!dpy || !win) return 0;
+    if (!gui_fb) gui_fb = (uint32_t *)calloc(GUI_W * GUI_H, 4);
+
+    enum {
+        CM_DOWNLOAD = 0,
+        CM_BUILTIN_ONCE = 1,
+        CM_BUILTIN_ALWAYS = 2,
+        CM_COUNT = 3
+    };
+    int sel = CM_DOWNLOAD;
+    int choice = 0;
+
+    set_cursor_visible(1);
+    gui_open = 1;
+    gui_nav_up = gui_nav_down = gui_nav_left = gui_nav_right = gui_nav_ok = gui_nav_back = 0;
+    mouse_clicked = 0;
+
+    while (!input.quit) {
+        pump_x11_events();
+        gamepad_read_events();
+
+        if (gui_nav_up) { sel = (sel - 1 + CM_COUNT) % CM_COUNT; gui_nav_up = 0; }
+        if (gui_nav_down) { sel = (sel + 1) % CM_COUNT; gui_nav_down = 0; }
+        if (gui_nav_back) { gui_nav_back = 0; choice = 0; break; }
+
+        int gx, gy;
+        gui_mouse_coords(&gx, &gy);
+        if (mouse_clicked) {
+            mouse_clicked = 0;
+            for (int i = 0; i < CM_COUNT; i++) {
+                int ry = 215 + i * 54;
+                if (gx >= 48 && gx <= GUI_W - 48 && gy >= ry && gy < ry + 44) {
+                    sel = i;
+                    gui_nav_ok = 1;
+                    break;
+                }
+            }
+        }
+
+        if (gui_nav_ok) {
+            gui_nav_ok = 0;
+            if (sel == CM_DOWNLOAD) {
+                choice = 1;
+            } else if (sel == CM_BUILTIN_ONCE) {
+                choice = 0;
+            } else if (sel == CM_BUILTIN_ALWAYS) {
+                ini_set_str(exe_dir, "compiler_mode", "interp");
+                choice = 0;
+            }
+            break;
+        }
+
+        gui_fill_rect(0, 0, GUI_W, GUI_H, 0xFF0E1420u);
+        gui_fill_rect(0, 0, GUI_W, 60, 0xFF182438u);
+        gui_draw_text(28, 12, 2, 0xFFFFE070u, "NO SYSTEM C COMPILER FOUND");
+        gui_draw_text(28, 38, 1, 0xFF88B0E8u, "CHOOSE HOW TO RUN THE DERIVED 68000 GAME CODE");
+
+        gui_fill_rect(48, 78, GUI_W - 96, 115, 0xFF141E30u);
+        gui_border_rect(48, 78, GUI_W - 96, 115, 1, 0xFF3A5888u);
+        gui_draw_text(64, 92, 1, 0xFFD8E4F8u,
+                      "THE 68000 MODULES FROM YOUR DISC WERE TRANSLATED TO C IN SAVES/DERIVED/GEN/.");
+        gui_draw_text(64, 112, 1, 0xFFD8E4F8u,
+                      "NO SYSTEM C COMPILER (GCC / CLANG) WAS DETECTED ON THIS DEVICE.");
+        gui_draw_text(64, 138, 1, 0xFF80F0A8u,
+                      "* OPTION 1: DOWNLOAD A PORTABLE C COMPILER (ZIG/CLANG) INTO SAVES/DERIVED/COMPILER/");
+        gui_draw_text(64, 156, 1, 0xFF80F0A8u,
+                      "  AND COMPILE NATIVE X86_64 CODE (RECOMP_USER.SO) ON THE FLY (~45 MB, ONE-TIME).");
+        gui_draw_text(64, 174, 1, 0xFFB8C8E0u,
+                      "* OPTION 2/3: RUN IMMEDIATELY WITH THE BUILT-IN 68000 ENGINE (NO DOWNLOAD NEEDED).");
+
+        const char *titles[CM_COUNT] = {
+            ">> DOWNLOAD PORTABLE C COMPILER & BUILD NATIVE CODE (RECOMMENDED)",
+            ">> USE BUILT-IN 68000 ENGINE (PLAY IMMEDIATELY, ASK NEXT TIME)",
+            ">> ALWAYS USE BUILT-IN 68000 ENGINE (PLAY IMMEDIATELY, DON'T ASK AGAIN)"
+        };
+        const char *subs[CM_COUNT] = {
+            "DOWNLOADS PORTABLE ZIG CC TO SAVES/DERIVED/COMPILER/ & BUILDS RECOMP_USER.SO",
+            "STARTS THE GAME RIGHT NOW WITHOUT DOWNLOADING ANYTHING",
+            "SAVES COMPILER_MODE=INTERP IN APPRENTICE.INI FOR FUTURE LAUNCHES"
+        };
+
+        for (int i = 0; i < CM_COUNT; i++) {
+            int ry = 215 + i * 54;
+            int is_sel = (i == sel);
+            uint32_t bg = is_sel ? 0xFF284A78u : (i == CM_DOWNLOAD ? 0xFF1A3228u : 0xFF162236u);
+            gui_fill_rect(48, ry, GUI_W - 96, 44, bg);
+            if (is_sel) gui_border_rect(48, ry, GUI_W - 96, 44, 2, 0xFFFFE070u);
+            uint32_t tcol = is_sel ? 0xFFFFE070u : (i == CM_DOWNLOAD ? 0xFF80FFB0u : 0xFFFFFFFFu);
+            gui_draw_text(64, ry + 10, 1, tcol, titles[i]);
+            gui_draw_text(64, ry + 26, 1, 0xFFB0C4E0u, subs[i]);
+        }
+
+        gui_fill_rect(0, GUI_H - 36, GUI_W, 36, 0xFF182438u);
+        gui_draw_text(28, GUI_H - 22, 1, 0xFFB8C8E0u,
+                      "D-PAD / ARROWS: SELECT OPTION   |   [A / ENTER]: CONFIRM   |   [B / ESC]: BUILT-IN ENGINE");
+
+        present_raw(gui_fb, GUI_W, GUI_H);
+        host_sleep_until(host_time() + 1.0 / 60.0);
+    }
+
+    gui_open = 0;
+    memset(keys, 0, sizeof keys);
+    set_cursor_visible(0);
+    return choice;
 }
 
 void host_fatal_box(const char *msg) {
@@ -1509,65 +1767,82 @@ void host_present(const uint32_t *fb, int w, int h) {
         present_raw(fb, w, h);
         return;
     }
-    static double prof_t0 = 0, prof_swap_sum = 0, prof_sleep_sum = 0;
-    static int prof_frames = 0, prof_presents = 0, consec_skips = 0;
+    static double prof_t0 = 0, prof_sleep_sum = 0;
+    static int prof_frames = 0;
     double t_before = host_time();
     if (prof_t0 == 0) prof_t0 = t_before;
     if (next_frame_time < 0) next_frame_time = t_before;
     next_frame_time += 1.0 / FIELD_RATE;
 
-    /* If an external frame limiter (e.g. Steam Deck Quick Access 30/40/45 FPS cap)
-       blocked the previous glXSwapBuffers past this field's deadline, skip
-       presenting this field so the 60 Hz CD-i emulation and 44.1 kHz audio
-       continue running at 100% full speed.  Always present at least 1 in 4 fields. */
-    int skip_present = (t_before > next_frame_time && consec_skips < 3);
-    if (skip_present) {
-        consec_skips++;
-    } else {
-        consec_skips = 0;
-        present_raw(fb, w, h);
-        prof_presents++;
-    }
+    /* Hand the finished 60 Hz field to the dedicated OpenGL presenter thread
+       (non-blocking mailbox copy, ~0.04 ms).  The presenter thread blocks on
+       glXSwapBuffers at whatever refresh rate Gamescope/display dictates
+       (60, 45, 40, 30, 24, 15 FPS) while the 60 Hz CD-i emulation and 44.1 kHz
+       audio continue ticking at an exact 16.67 ms period. */
+    present_raw(fb, w, h);
     double now = host_time();
-    double swap_dt = skip_present ? 0.0 : (now - t_before);
-    double sleep_dt = 0;
 
-    /* Monotonic 60.0 Hz frame clock:
-       - If glXSwapBuffers returns immediately (< 16.67 ms), host_sleep_until()
-         sleeps for the exact remaining fraction of the 16.67 ms field period.
-       - If glXSwapBuffers already blocked on a compositor fence up to or past
-         next_frame_time, now >= next_frame_time so we do not add a second sleep.
-       - If we ever fall more than 4 fields (~66.7 ms) behind (e.g. disc load),
-         clamp next_frame_time = now so subsequent frames don't burst. */
-    int hw_vsync = (swap_dt >= 0.004);
+    /* Gentle phase-lock (PLL): keep the emulation thread's frame publish time
+       centered (~8.3 ms) between compositor vblanks so frame completion never
+       collides with glXSwapBuffers wakeup at 30/60 Hz. */
+    if (pres_thread_started) {
+        double last_vblank = 0.0, vdt = 0.0;
+        pthread_mutex_lock(&pres_mtx);
+        last_vblank = pres_last_swap_done;
+        vdt = pres_vblank_dt;
+        pthread_mutex_unlock(&pres_mtx);
+        if (last_vblank > 0.0 && (now - last_vblank) < 0.100 && vdt >= 0.015) {
+            double period = 1.0 / FIELD_RATE;
+            double delta = now - last_vblank;
+            int k = (int)(delta / period);
+            double phase = delta - (double)k * period;
+            if (phase < 0.0) phase += period;
+            double err = (0.5 * period) - phase;
+            if (err > 0.00025) err = 0.00025;
+            else if (err < -0.00025) err = -0.00025;
+            next_frame_time += err;
+        }
+    }
+
+    double sleep_dt = 0;
     if (now < next_frame_time) {
         host_sleep_until(next_frame_time);
         double after_sleep = host_time();
         sleep_dt = after_sleep - now;
         now = after_sleep;
-    } else if (now - next_frame_time > 4.0 / FIELD_RATE) {
+    } else if (now - next_frame_time > 2.0 / FIELD_RATE) {
         next_frame_time = now;
     }
 
-    prof_swap_sum += swap_dt;
     prof_sleep_sum += sleep_dt;
     prof_frames++;
     if (now - prof_t0 >= 2.0) {
         double elapsed = now - prof_t0;
-        int pcount = prof_presents > 0 ? prof_presents : 1;
+        double swap_sum = 0.0;
+        int presents = 0, hw_vsync = 0;
+        if (pres_thread_started) {
+            pthread_mutex_lock(&pres_mtx);
+            swap_sum = pres_swap_sum;
+            presents = pres_swap_count;
+            hw_vsync = pres_last_hw_vsync;
+            pres_swap_sum = 0.0;
+            pres_swap_count = 0;
+            pthread_mutex_unlock(&pres_mtx);
+        } else {
+            presents = prof_frames;
+        }
+        int pcount = presents > 0 ? presents : 1;
         LOG("perf: %.1f sim_fps / %.1f disp_fps (avg field %.2f ms, glXSwap %.2f ms, sleep %.2f ms, hw_vsync=%d, audio_q=%d)",
             prof_frames / elapsed,
-            prof_presents / elapsed,
+            presents / elapsed,
             elapsed * 1000.0 / prof_frames,
-            prof_swap_sum * 1000.0 / pcount,
+            swap_sum * 1000.0 / pcount,
             prof_sleep_sum * 1000.0 / prof_frames,
             hw_vsync,
             host_audio_queued());
         prof_t0 = now;
-        prof_swap_sum = 0;
         prof_sleep_sum = 0;
         prof_frames = 0;
-        prof_presents = 0;
     }
 }
 

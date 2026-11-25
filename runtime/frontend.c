@@ -394,6 +394,7 @@ static void init(void) {
 
 void frame_boundary(void) {
     if (!inited) init();
+    if (g_cdi_pause_req > 0) g_cdi_pause_req--;
     host_poll();
     hotkeys();
     t_real++;

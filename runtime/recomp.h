@@ -83,23 +83,57 @@ typedef uint32_t (*RecompFn)(uint32_t pc);
 typedef struct { uint32_t addr; RecompFn fn; } RecompEntry;
 typedef struct { uint32_t addr; const char *name; } RecompName;
 
-extern const RecompEntry recomp_entries[];
-extern const int recomp_num_entries;
-extern const RecompName recomp_names[];
-extern const int recomp_num_names;
-extern uint32_t recomp_code_lo, recomp_code_hi;
+typedef struct {
+    M68K *m68k_ptr;
+    uint8_t **ram_ptr;
+    uint32_t *jt_expected_ptr;
+    uint32_t (*recomp_bad_entry_fn)(uint32_t pc, uint32_t func);
+    uint32_t (*m68k_call_fn)(uint32_t target);
+    uint32_t (*m68k_exception_fn)(int vec, uint32_t addr);
+    uint32_t (*m68k_trap_fn)(int n, uint32_t func, uint32_t next);
+    uint32_t (*os9_syscall_fn)(uint32_t code, uint32_t next);
+    void (*jt_check_fn)(int reg, uint32_t addr);
+} RecompHostAPI;
 
+#ifdef RECOMP_PLUGIN_DLL
+#ifdef _WIN32
+#define RECOMP_EXPORT __declspec(dllexport)
+#else
+#define RECOMP_EXPORT __attribute__((visibility("default")))
+#endif
+extern RecompHostAPI recomp_host_api;
+#define m68k (*recomp_host_api.m68k_ptr)
+#define RAM  (*recomp_host_api.ram_ptr)
+#define jt_expected (*recomp_host_api.jt_expected_ptr)
+#define recomp_bad_entry recomp_host_api.recomp_bad_entry_fn
+#define m68k_call        recomp_host_api.m68k_call_fn
+#define m68k_exception   recomp_host_api.m68k_exception_fn
+#define m68k_trap        recomp_host_api.m68k_trap_fn
+#define os9_syscall      recomp_host_api.os9_syscall_fn
+#define jt_check         recomp_host_api.jt_check_fn
+#else
+#define RECOMP_EXPORT
+#endif
+
+extern RECOMP_EXPORT const RecompEntry recomp_entries[];
+extern RECOMP_EXPORT const int recomp_num_entries;
+extern RECOMP_EXPORT const RecompName recomp_names[];
+extern RECOMP_EXPORT const int recomp_num_names;
+extern RECOMP_EXPORT uint32_t recomp_code_lo, recomp_code_hi;
+
+#ifndef RECOMP_PLUGIN_DLL
 uint32_t recomp_bad_entry(uint32_t pc, uint32_t func);
 uint32_t m68k_call(uint32_t target);
 uint32_t m68k_exception(int vec, uint32_t addr);
 uint32_t m68k_trap(int n, uint32_t func, uint32_t next);
 uint32_t os9_syscall(uint32_t code, uint32_t next);
+void jt_check(int reg, uint32_t addr);
+extern uint32_t jt_expected;
+#endif
 void m68k_divu(int reg, uint32_t src, uint32_t addr);
 void m68k_divs(int reg, uint32_t src, uint32_t addr);
 /* jump-table calls (jsr N(a5) / jsr N(a6)) are resolved statically; check
    that the table register still points at the main program's table */
-void jt_check(int reg, uint32_t addr);
-extern uint32_t jt_expected;
 #define JTCHECK(reg, addr) do { if (A(reg) != jt_expected) jt_check(reg, addr); } while (0)
 
 int game_skip_insn(uint32_t addr);     /* frame.c: hooked instruction (cheats) */

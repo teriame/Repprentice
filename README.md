@@ -49,18 +49,26 @@ conversion tools embedded directly inside the binary:
   interactive graphical launcher and file browser (navigable with Steam Deck
   controls, keyboard, or mouse/touch) that locates your `.cue`/`.bin` (or
   converts a `.chd` disc image into `./saves/`), derives the 68000-to-C code
-  locally on your machine into `./saves/derived/` (and compiles it to a native
-  module `./saves/derived/recomp_user.so` if a C compiler is present), and
-  provides an in-game Quick Menu (`Select`/`View` button or `F1`). To register a
-  native Linux Steam shortcut (clearing any accidental Proton override), click
+  locally on your machine into `./saves/derived/`, and compiles it to a native
+  module `./saves/derived/recomp_user.so` (if no system C compiler is present,
+  an interactive selection screen lets you either download a portable Zig/Clang
+  C compiler into `./saves/derived/compiler/` on the fly or run immediately with
+  the built-in 68000 engine). It provides an in-game Quick Menu overlay
+  (`Start` / `Burger` `≡` button or `F1`) while `Select` / `View` (`⧉`) or `P`
+  opens the original CD-i in-game pause menu. To register a native Linux Steam
+  shortcut (clearing any accidental Proton override), click
   **Steam Shortcut (Native Linux)** in the launcher or pass `--add-to-steam`.
 * **`Apprentice-<version>-x64.exe`** (Windows): a single standalone `.exe` that
   behaves identically to the Linux `.AppImage`. Place it in any folder and run
   it: it opens the same interactive graphical launcher and in-window file
   browser (or Windows file dialog), converts `.chd` images into `./saves/`,
-  derives the 68000-to-C code locally into `./saves/derived/`, renders Cartoon
-  HD / Cartoon HD+ directly on the GPU via Direct3D 11, and provides the
-  in-game Quick Menu (`F1` or Xbox/XInput `View`/`Select` button).
+  derives the 68000-to-C code locally into `./saves/derived/` (offering the same
+  interactive selection screen to download a portable Zig/Clang C compiler into
+  `./saves/derived/compiler/` or use the built-in 68000 engine if no system C
+  compiler is found), renders Cartoon HD / Cartoon HD+ directly on the GPU via
+  Direct3D 11, and provides the in-game Quick Menu overlay (`Start` / `Menu` `≡`
+  button or `F1`) while `Select` / `View` (`⧉`) or `P` opens the original CD-i
+  in-game pause menu.
 
 Windows 10 or later (64-bit), or 64-bit Linux (SteamOS 3+, Ubuntu, Fedora,
 Arch, Debian).
@@ -148,11 +156,13 @@ Saves and other files go to `saves/` next to the program (or `.AppImage`):
 | Thumbpad | Arrow keys (Shift = faster) | Left stick / D-pad |
 | Button 1 | Z, Space or A | A |
 | Button 2 | X, Ctrl or S | B or Y |
-| Both buttons | C or Enter | X or Start |
+| Both buttons | C or Enter | X |
+| Original CD-i In-Game Pause Menu | P or Pause | Select / View (`⧉`) |
 
 | Key / Button | Function |
 |--------------|----------|
-| F1 or Select (View) / Guide | In-game Quick Menu overlay (Windows, Linux, Steam Deck) |
+| F1 or Start / Burger (`≡`) / Guide | In-game Quick Menu overlay (Windows, Linux, Steam Deck) |
+| P, Pause or Select / View (`⧉`) | Original CD-i in-game pause menu (`CONTINUE` / `ABORT`) |
 | F2 or L1 / LB | Quicksave to the current slot |
 | F3 | Next quicksave slot (1-10) |
 | F4 or R1 / RB | Load the current slot |

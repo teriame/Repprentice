@@ -13,28 +13,77 @@
 static char exe_dir[512] = ".";
 
 static void init_exe_dir(void) {
-    /* Always keep runtime writes (saves/, apprentice.ini) strictly inside the
-       current working directory (CWD, or OWD when launched via an AppImage
-       runner) so the program never writes outside CWD or tmp. */
-#ifndef _WIN32
-    const char *owd = getenv("OWD");
-    if (owd && owd[0] && strncmp(owd, "/tmp/", 5) != 0 && access(owd, W_OK) == 0) {
-        snprintf(exe_dir, sizeof exe_dir, "%s", owd);
-        return;
+#ifdef _WIN32
+    char p[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, p, sizeof p);
+    if (n > 0 && n < sizeof p) {
+        char *s = strrchr(p, '\\');
+        if (s) {
+            *s = 0;
+            snprintf(exe_dir, sizeof exe_dir, "%s", p);
+            _chdir(exe_dir);
+            return;
+        }
     }
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof cwd) && strncmp(cwd, "/tmp/", 5) != 0 && access(cwd, W_OK) == 0) {
-        snprintf(exe_dir, sizeof exe_dir, "%s", cwd);
-        return;
-    }
+    if (_getcwd(p, sizeof p)) snprintf(exe_dir, sizeof exe_dir, "%s", p);
 #else
-    char cwd[MAX_PATH];
-    if (_getcwd(cwd, sizeof cwd)) {
-        snprintf(exe_dir, sizeof exe_dir, "%s", cwd);
+    char p[PATH_MAX];
+    /* 1. APPIMAGE env var holds the real path to the .AppImage on disk */
+    const char *appimg = getenv("APPIMAGE");
+    if (appimg && appimg[0]) {
+        if (!realpath(appimg, p)) snprintf(p, sizeof p, "%s", appimg);
+        char *s = strrchr(p, '/');
+        if (s && strncmp(p, "/tmp/", 5) != 0) {
+            *s = 0;
+            snprintf(exe_dir, sizeof exe_dir, "%s", p);
+            if (chdir(exe_dir) == 0) {}
+            return;
+        }
+    }
+    /* 2. $APPDIR/.appimage_path marker written by our AppImage runtime stub */
+    const char *appdir = getenv("APPDIR");
+    if (appdir && appdir[0]) {
+        char marker[PATH_MAX];
+        snprintf(marker, sizeof marker, "%s/.appimage_path", appdir);
+        FILE *mf = fopen(marker, "r");
+        if (mf) {
+            char line[PATH_MAX] = "";
+            if (fgets(line, sizeof line, mf)) {
+                line[strcspn(line, "\r\n")] = 0;
+                if (!realpath(line, p)) snprintf(p, sizeof p, "%s", line);
+                char *s = strrchr(p, '/');
+                if (s && strncmp(p, "/tmp/", 5) != 0) {
+                    *s = 0;
+                    fclose(mf);
+                    snprintf(exe_dir, sizeof exe_dir, "%s", p);
+                    if (chdir(exe_dir) == 0) {}
+                    return;
+                }
+            }
+            fclose(mf);
+        }
+    }
+    /* 3. /proc/self/exe (when running a native binary outside /tmp) */
+    ssize_t n = readlink("/proc/self/exe", p, sizeof p - 1);
+    if (n > 0) {
+        p[n] = 0;
+        if (strncmp(p, "/tmp/", 5) != 0) {
+            char *s = strrchr(p, '/');
+            if (s) {
+                *s = 0;
+                snprintf(exe_dir, sizeof exe_dir, "%s", p);
+                if (chdir(exe_dir) == 0) {}
+                return;
+            }
+        }
+    }
+    /* 4. Current working directory fallback (never allow Steam's internal folder) */
+    if (getcwd(p, sizeof p) && strncmp(p, "/tmp/", 5) != 0 &&
+        !strstr(p, "/.local/share/Steam") && access(p, W_OK) == 0) {
+        snprintf(exe_dir, sizeof exe_dir, "%s", p);
         return;
     }
 #endif
-    snprintf(exe_dir, sizeof exe_dir, ".");
 }
 
 /* <exe_name>.ini next to the executable: settings the installer writes and the
@@ -168,23 +217,14 @@ static int find_image(const char *arg, char *out, size_t n) {
         else if (L > 4 && !_stricmp(cfg + L - 4, ".bin")) { snprintf(out, n, "%s", cfg); if (is_cdi_image(out)) return 0; }
         else if (!scan_dir_for_image(cfg, out, n)) return 0;
     }
-    /* look for rom/*.bin or saves/*.bin next to the working directory or the executable, up to 4 levels up */
+    /* look for saves/*.bin, rom/*.bin, or *.bin strictly inside exe_dir */
     if (!scan_dir_for_image(g_data_dir, out, n)) return 0;
-    const char *bases[2] = {".", exe_dir};
-    for (int b = 0; b < 2; b++) {
-        char dir[600];
-        snprintf(dir, sizeof dir, "%s", bases[b]);
-        for (int up = 0; up <= 4; up++) {
-            char romdir[700], savedir[700];
-            snprintf(romdir, sizeof romdir, "%s/rom", dir);
-            if (!scan_dir_for_image(romdir, out, n)) return 0;
-            snprintf(savedir, sizeof savedir, "%s/saves", dir);
-            if (!scan_dir_for_image(savedir, out, n)) return 0;
-            if (!scan_dir_for_image(dir, out, n)) return 0;
-            size_t L = strlen(dir);
-            if (L + 3 < sizeof dir) strcat(dir, "/..");
-        }
-    }
+    char romdir[700], savedir[700];
+    snprintf(romdir, sizeof romdir, "%s/rom", exe_dir);
+    if (!scan_dir_for_image(romdir, out, n)) return 0;
+    snprintf(savedir, sizeof savedir, "%s/saves", exe_dir);
+    if (!scan_dir_for_image(savedir, out, n)) return 0;
+    if (!scan_dir_for_image(exe_dir, out, n)) return 0;
     return -1;
 }
 

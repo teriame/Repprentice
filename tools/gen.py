@@ -1034,8 +1034,12 @@ def write_tables(outdir, mods):
                 o.write('uint32_t f_%06x(uint32_t pc);\n' % e)
     with open(os.path.join(outdir, 'recomp_table.c'), 'w') as o:
         o.write('/* generated */\n#include "recomp.h"\n\n')
-        o.write('uint32_t recomp_code_lo = 0x%x, recomp_code_hi = 0x%x;\n' % (lo, hi))
-        o.write('const RecompEntry recomp_entries[] = {\n')
+        o.write('#ifdef RECOMP_PLUGIN_DLL\n')
+        o.write('RecompHostAPI recomp_host_api;\n')
+        o.write('RECOMP_EXPORT void recomp_plugin_init(const RecompHostAPI *api) { recomp_host_api = *api; }\n')
+        o.write('#endif\n\n')
+        o.write('RECOMP_EXPORT uint32_t recomp_code_lo = 0x%x, recomp_code_hi = 0x%x;\n' % (lo, hi))
+        o.write('RECOMP_EXPORT const RecompEntry recomp_entries[] = {\n')
         nentries = 0
         for _, entries, _, _ in mods:
             for a, f in entries:
@@ -1043,8 +1047,8 @@ def write_tables(outdir, mods):
                 nentries += 1
         if not nentries:
             o.write('  {0, NULL},\n')
-        o.write('};\nconst int recomp_num_entries = %d;\n' % nentries)
-        o.write('const RecompName recomp_names[] = {\n')
+        o.write('};\nRECOMP_EXPORT const int recomp_num_entries = %d;\n' % nentries)
+        o.write('RECOMP_EXPORT const RecompName recomp_names[] = {\n')
         nnames = 0
         for _, _, names, _ in mods:
             for a, n in sorted(names.items()):
@@ -1052,7 +1056,7 @@ def write_tables(outdir, mods):
                 nnames += 1
         if not nnames:
             o.write('  {0, "?"},     /* no MacsBug symbols: C forbids an empty initializer */\n')
-        o.write('};\nconst int recomp_num_names = %d;\n' % (nnames if nnames else 1))
+        o.write('};\nRECOMP_EXPORT const int recomp_num_names = %d;\n' % (nnames if nnames else 1))
 
 
 def ensure_disc_image():

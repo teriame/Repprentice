@@ -80,8 +80,6 @@ int main(int argc, char **argv) {
     }
     self[n] = 0;
 
-    char owd[PATH_MAX];
-    if (getcwd(owd, sizeof owd)) setenv("OWD", owd, 1);
     setenv("APPIMAGE", self, 1);
     setenv("ARGV0", argv[0], 1);
 
@@ -175,6 +173,15 @@ int main(int argc, char **argv) {
     }
 
     setenv("APPDIR", g_mount_dir, 1);
+    {
+        char marker[PATH_MAX + 32];
+        snprintf(marker, sizeof marker, "%s/.appimage_path", g_mount_dir);
+        FILE *mf = fopen(marker, "w");
+        if (mf) {
+            fprintf(mf, "%s\n", self);
+            fclose(mf);
+        }
+    }
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
     signal(SIGHUP, on_sig);
@@ -184,6 +191,16 @@ int main(int argc, char **argv) {
 
     pid_t pid = fork();
     if (pid == 0) {
+        /* Always chdir to the directory containing the .AppImage file itself
+           so CWD is the AppImage's folder (never /home/deck/.local/share/Steam
+           or /home/deck when launched from Steam or Dolphin). */
+        char self_dir[PATH_MAX];
+        snprintf(self_dir, sizeof self_dir, "%s", self);
+        char *sl = strrchr(self_dir, '/');
+        if (sl) {
+            *sl = 0;
+            if (chdir(self_dir) == 0) {}
+        }
         int new_argc = argc - arg_start + 1;
         char **new_argv = (char **)calloc((size_t)new_argc + 1, sizeof(char *));
         new_argv[0] = apprun;
