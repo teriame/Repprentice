@@ -1,0 +1,18 @@
+# disc image, extracted modules, and user-derived C code
+rom/
+extracted/
+gen/
+# build output
+build/
+run/
+*.exe
+/apprentice
+/apprentice_hd
+*.AppImage
+saves/
+*.log
+cmp/
+# release packages (tools/package.ps1)
+dist/
+__pycache__/
+.venv/

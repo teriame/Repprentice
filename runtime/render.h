@@ -1,0 +1,27 @@
+/* GPU presenter interface (render_d3d11.c). */
+#pragma once
+#include <stdint.h>
+
+#define RENDER_ASPECTS 4   /* 4:3 + blurred sides, 4:3, stretch, zoom */
+#define RENDER_FILTERS 4   /* sharp, smooth, CRT, nearest */
+
+typedef struct {
+    int aspect;
+    int filter;
+    int crop_borders;
+} RenderSettings;
+
+extern RenderSettings render_settings;
+const char *render_aspect_name(int a);
+const char *render_filter_name(int f);
+
+#ifdef _WINDEF_
+int render_init(HWND hwnd);
+#endif
+#ifndef _WIN32
+int render_init_x11(void *dpy, unsigned long win);
+void render_set_window_size(int w, int h);
+void render_shutdown(void);
+#endif
+int render_gpu_active(void);
+int render_present(const uint32_t *fb, int w, int h);
