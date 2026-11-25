@@ -17,6 +17,8 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <pthread.h>
+
+void host_audio_stats(int *lat_ms, int *min_lat_ms, int *underruns, double *ratio);
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -1782,27 +1784,12 @@ void host_present(const uint32_t *fb, int w, int h) {
     present_raw(fb, w, h);
     double now = host_time();
 
-    /* Gentle phase-lock (PLL): keep the emulation thread's frame publish time
-       centered (~8.3 ms) between compositor vblanks so frame completion never
-       collides with glXSwapBuffers wakeup at 30/60 Hz. */
-    if (pres_thread_started) {
-        double last_vblank = 0.0, vdt = 0.0;
-        pthread_mutex_lock(&pres_mtx);
-        last_vblank = pres_last_swap_done;
-        vdt = pres_vblank_dt;
-        pthread_mutex_unlock(&pres_mtx);
-        if (last_vblank > 0.0 && (now - last_vblank) < 0.100 && vdt >= 0.015) {
-            double period = 1.0 / FIELD_RATE;
-            double delta = now - last_vblank;
-            int k = (int)(delta / period);
-            double phase = delta - (double)k * period;
-            if (phase < 0.0) phase += period;
-            double err = (0.5 * period) - phase;
-            if (err > 0.00025) err = 0.00025;
-            else if (err < -0.00025) err = -0.00025;
-            next_frame_time += err;
-        }
-    }
+    /* No phase-lock to the display vblank here: the emulation (and therefore
+       the 44.1 kHz audio stream) must run on the wall clock at exactly
+       FIELD_RATE.  Nudging next_frame_time toward the compositor's vblank
+       phase made the emulation run at the display's rate (59.9 Hz, or 60.9 Hz
+       when swaps don't block), which over/under-filled the audio buffer and
+       caused crackles and dropouts. */
 
     double sleep_dt = 0;
     if (now < next_frame_time) {
@@ -1832,14 +1819,16 @@ void host_present(const uint32_t *fb, int w, int h) {
             presents = prof_frames;
         }
         int pcount = presents > 0 ? presents : 1;
-        LOG("perf: %.1f sim_fps / %.1f disp_fps (avg field %.2f ms, glXSwap %.2f ms, sleep %.2f ms, hw_vsync=%d, audio_q=%d)",
+        int a_lat = 0, a_min = 0, a_low = 0; double a_ratio = 1.0;
+        host_audio_stats(&a_lat, &a_min, &a_low, &a_ratio);
+        LOG("perf: %.1f sim_fps / %.1f disp_fps (avg field %.2f ms, glXSwap %.2f ms, sleep %.2f ms, hw_vsync=%d, audio_q=%d, audio_lat=%d ms, audio_min=%d ms, audio_low=%d, audio_ratio=%.5f)",
             prof_frames / elapsed,
             presents / elapsed,
             elapsed * 1000.0 / prof_frames,
             swap_sum * 1000.0 / pcount,
             prof_sleep_sum * 1000.0 / prof_frames,
             hw_vsync,
-            host_audio_queued());
+            host_audio_queued(), a_lat, a_min, a_low, a_ratio);
         prof_t0 = now;
         prof_sleep_sum = 0;
         prof_frames = 0;
@@ -1965,53 +1954,104 @@ static snd_pcm_t *alsa_dev;
 static snd_pcm_writei_fn p_alsa_writei;
 static snd_pcm_recover_fn p_alsa_recover;
 
+/* Audio output thread.
+ *
+ * Design (clicks/crackles are caused by discontinuities, so none are allowed):
+ *  - Never insert silence while playing and never duplicate or drop samples.
+ *    The only time the device gets silence is when the ring is truly empty;
+ *    in that case PulseAudio/PipeWire's own prebuf handles the restart.
+ *  - Every push from the emulation thread is forwarded right away (variable
+ *    output size), so PulseAudio's ~100 ms buffer always stays full.
+ *  - Clock drift between the 60.0 Hz emulation and the audio device is
+ *    absorbed by a very slow, very small (max +/-0.2%, ~3 cents) resampling
+ *    ratio, driven by the *total* buffered audio (ring + PulseAudio latency)
+ *    and smoothed over several seconds so the pitch never wobbles audibly. */
+typedef uint64_t (*pa_simple_get_latency_fn)(pa_simple *, int *);
+static pa_simple_get_latency_fn p_pa_latency;
+
+static double aud_frac;
+static double aud_ratio = 1.0;
+static double aud_lat_ema = -1.0;        /* smoothed total buffered frames */
+static double aud_target = -1.0;         /* target total buffered frames */
+static volatile int aud_lat_ms;          /* last measured total latency (ms) */
+static volatile int aud_min_lat_ms = 1 << 30;
+static volatile int aud_underruns;       /* ring empty while device was low */
+
+static inline int16_t aud_round(double v) {
+    if (v > 32767.0) return 32767;
+    if (v < -32768.0) return -32768;
+    return (int16_t)(v >= 0 ? v + 0.5 : v - 0.5);
+}
+
 static void *audio_thread(void *arg) {
     (void)arg;
-    int16_t chunk[AUD_CHUNK * 2];
-    int prefill = 1;
+    int16_t chunk[AUD_CHUNK * 2 * 2];
     while (aud_running) {
         uint32_t avail;
         pthread_mutex_lock(&aud_mtx);
         for (;;) {
             avail = aud_wr - aud_rd;
-            /* Wait for 4 fields (~66.7 ms) on initial startup or after an underrun,
-               and 1 full field (735 frames = 16.67 ms) during steady playback. */
-            uint32_t need = prefill ? (AUD_CHUNK * 4) : AUD_CHUNK;
-            if (!aud_running || avail >= need) break;
+            if (!aud_running || avail >= 64) break;
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 25000000L; /* 25 ms timeout */
+            ts.tv_nsec += 50000000L;
             if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-            if (pthread_cond_timedwait(&aud_cv, &aud_mtx, &ts) == ETIMEDOUT) {
-                avail = aud_wr - aud_rd;
-                if (avail < AUD_CHUNK) prefill = 1;
-                break;
-            }
+            pthread_cond_timedwait(&aud_cv, &aud_mtx, &ts);
         }
         pthread_mutex_unlock(&aud_mtx);
         if (!aud_running) break;
-        if (avail < (prefill ? (AUD_CHUNK * 4) : AUD_CHUNK)) continue;
-        if (prefill) {
-            /* Pre-prime PulseAudio / PipeWire's internal playback buffer with 2
-               silent fields when starting or resuming from the pause menu so it
-               doesn't immediately swallow all 4 fields from aud_ring at once. */
-            memset(chunk, 0, (size_t)AUD_CHUNK * 4);
-            if (pa_dev && p_pa_write) {
-                int err = 0;
-                p_pa_write(pa_dev, chunk, (size_t)AUD_CHUNK * 4, &err);
-                p_pa_write(pa_dev, chunk, (size_t)AUD_CHUNK * 4, &err);
+
+        /* Measure total buffered audio: ring + device-side latency. */
+        double dev_frames = -1.0;
+        if (pa_dev && p_pa_latency) {
+            int err = 0;
+            uint64_t us = p_pa_latency(pa_dev, &err);
+            if (err == 0 || us > 0) dev_frames = (double)us * 44100.0 / 1e6;
+        }
+        if (dev_frames >= 0.0) {
+            double total = dev_frames + (double)avail;
+            int ms = (int)(total * 1000.0 / 44100.0);
+            aud_lat_ms = ms;
+            if (ms < aud_min_lat_ms) aud_min_lat_ms = ms;
+            if (dev_frames < 44100.0 * 0.004) aud_underruns++;
+            if (aud_lat_ema < 0.0) {
+                aud_lat_ema = total;
+            } else {
+                aud_lat_ema += (total - aud_lat_ema) * 0.01;   /* ~1.5 s time constant */
             }
-            prefill = 0;
+            /* Lock the target to the level the stream naturally settles at
+               after the first ~2 s, so we only correct drift, not latency. */
+            static int warm;
+            if (aud_target < 0.0 && ++warm > 120) aud_target = aud_lat_ema;
+            if (aud_target > 0.0) {
+                double dev = (aud_lat_ema - aud_target) / (44100.0 * 0.050); /* +/-50 ms -> full */
+                if (dev > 1.0) dev = 1.0;
+                if (dev < -1.0) dev = -1.0;
+                double want = 1.0 + 0.002 * dev;
+                aud_ratio += (want - aud_ratio) * 0.02;            /* glide, no steps */
+            }
         }
 
-        uint32_t n = AUD_CHUNK;
+        /* Output as many frames as the ring can supply at the current ratio
+           (always forward everything we have, at most 2 fields at once). */
+        double ratio = aud_ratio;
+        double can = ((double)avail - 1.0 - aud_frac) / ratio;
+        if (can < 1.0) continue;
+        uint32_t n = (uint32_t)can;
+        if (n > AUD_CHUNK * 2) n = AUD_CHUNK * 2;
         uint32_t r = aud_rd;
         for (uint32_t i = 0; i < n; i++) {
-            uint32_t idx = (r + i) & AUD_RING_MASK;
-            chunk[i * 2]     = aud_ring[idx * 2];
-            chunk[i * 2 + 1] = aud_ring[idx * 2 + 1];
+            double pos = aud_frac + (double)i * ratio;
+            uint32_t i0 = (uint32_t)pos;
+            double t = pos - (double)i0;
+            uint32_t a = (r + i0) & AUD_RING_MASK, b = (r + i0 + 1) & AUD_RING_MASK;
+            chunk[i * 2]     = aud_round(aud_ring[a * 2]     * (1.0 - t) + aud_ring[b * 2]     * t);
+            chunk[i * 2 + 1] = aud_round(aud_ring[a * 2 + 1] * (1.0 - t) + aud_ring[b * 2 + 1] * t);
         }
-        __atomic_store_n(&aud_rd, r + n, __ATOMIC_RELEASE);
+        double end = aud_frac + (double)n * ratio;
+        uint32_t consumed = (uint32_t)end;
+        aud_frac = end - (double)consumed;
+        __atomic_store_n(&aud_rd, r + consumed, __ATOMIC_RELEASE);
 
         if (pa_dev && p_pa_write) {
             int err = 0;
@@ -2024,6 +2064,15 @@ static void *audio_thread(void *arg) {
     return NULL;
 }
 
+/* Diagnostics for the perf log line. */
+void host_audio_stats(int *lat_ms, int *min_lat_ms, int *underruns, double *ratio) {
+    *lat_ms = aud_lat_ms;
+    *min_lat_ms = aud_min_lat_ms == (1 << 30) ? -1 : aud_min_lat_ms;
+    *underruns = aud_underruns;
+    *ratio = aud_ratio;
+    aud_min_lat_ms = 1 << 30;
+}
+
 void host_audio_init(int rate) {
     if (g_headless) return;
     /* 1. Try PulseAudio / PipeWire-Pulse */
@@ -2031,6 +2080,7 @@ void host_audio_init(int rate) {
     if (pa_lib) {
         pa_simple_new_fn p_new = (pa_simple_new_fn)dlsym(pa_lib, "pa_simple_new");
         p_pa_write = (pa_simple_write_fn)dlsym(pa_lib, "pa_simple_write");
+        p_pa_latency = (pa_simple_get_latency_fn)dlsym(pa_lib, "pa_simple_get_latency");
         if (p_new && p_pa_write) {
             pa_sample_spec ss = {3 /* PA_SAMPLE_S16LE */, (uint32_t)rate, 2};
             pa_buffer_attr ba = {
@@ -2117,21 +2167,9 @@ void host_audio_push(const int16_t *s, int frames) {
         aud_ring[idx * 2 + 1] = s[i * 2 + 1];
     }
     w += n;
-    /* In Steam Deck Gaming Mode, Gamescope's display refresh is ~59.94 Hz while
-       the emulated CD-i clock generates 735 * 60 = 44100 samples/sec.  If our
-       ring buffer runs below 3 fields during active audio, gently duplicate the
-       last sample frame (faster when < 1 field, 2 frames when 1-2 fields) so the
-       ring cushion stays at 3-4 fields without ever hitting a PipeWire underrun. */
-    if (queued < AUD_CHUNK * 3 && n >= 700 && (AUD_RING_FRAMES - (w - r)) >= 8) {
-        int pad_n = (queued < AUD_CHUNK) ? 6 : 2;
-        int16_t lastL = s[(n - 1) * 2], lastR = s[(n - 1) * 2 + 1];
-        for (int pad = 0; pad < pad_n; pad++) {
-            uint32_t idx = (w + (uint32_t)pad) & AUD_RING_MASK;
-            aud_ring[idx * 2]     = lastL;
-            aud_ring[idx * 2 + 1] = lastR;
-        }
-        w += (uint32_t)pad_n;
-    }
+    /* No sample padding here: clock drift between the emulated 44.1 kHz stream
+       and the audio device is absorbed by the dynamic-rate resampler in
+       audio_thread(), which never introduces waveform discontinuities. */
     __atomic_store_n(&aud_wr, w, __ATOMIC_RELEASE);
     pthread_mutex_lock(&aud_mtx);
     pthread_cond_signal(&aud_cv);
