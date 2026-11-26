@@ -21,7 +21,41 @@ typedef struct {
     int yield;              /* set when code yielded at a backward branch */
 } M68K;
 
+typedef struct {
+    M68K *m68k_ptr;
+    uint8_t **ram_ptr;
+    uint32_t *jt_expected_ptr;
+    uint32_t (*recomp_bad_entry_fn)(uint32_t pc, uint32_t func);
+    uint32_t (*m68k_call_fn)(uint32_t target);
+    uint32_t (*m68k_exception_fn)(int vec, uint32_t addr);
+    uint32_t (*m68k_trap_fn)(int n, uint32_t func, uint32_t next);
+    uint32_t (*os9_syscall_fn)(uint32_t code, uint32_t next);
+    void (*jt_check_fn)(int reg, uint32_t addr);
+    int (*game_skip_insn_fn)(uint32_t addr);
+} RecompHostAPI;
+
+#ifdef RECOMP_PLUGIN_DLL
+#ifdef _WIN32
+#define RECOMP_EXPORT __declspec(dllexport)
+#else
+#define RECOMP_EXPORT __attribute__((visibility("default")))
+#endif
+extern RecompHostAPI recomp_host_api;
+#define m68k (*recomp_host_api.m68k_ptr)
+#define RAM  (*recomp_host_api.ram_ptr)
+#define jt_expected (*recomp_host_api.jt_expected_ptr)
+#define recomp_bad_entry recomp_host_api.recomp_bad_entry_fn
+#define m68k_call        recomp_host_api.m68k_call_fn
+#define m68k_exception   recomp_host_api.m68k_exception_fn
+#define m68k_trap        recomp_host_api.m68k_trap_fn
+#define os9_syscall      recomp_host_api.os9_syscall_fn
+#define jt_check         recomp_host_api.jt_check_fn
+#define game_skip_insn   recomp_host_api.game_skip_insn_fn
+#else
+#define RECOMP_EXPORT
 extern M68K m68k;
+extern uint8_t *RAM;
+#endif
 
 #define D(n) m68k.d[n]
 #define A(n) m68k.a[n]
@@ -46,7 +80,6 @@ static FORCEINLINE uint16_t GET_SR(void) { return (uint16_t)((m68k.srh << 8) | G
 /* ---------------------------------------------------------------- memory */
 #define MEM_SIZE  0x01000000u   /* 16 MB flat address space */
 #define MEM_MASK  0x00FFFFFFu
-extern uint8_t *RAM;
 
 void mem_fault(uint32_t addr, int write);
 
@@ -83,38 +116,6 @@ typedef uint32_t (*RecompFn)(uint32_t pc);
 typedef struct { uint32_t addr; RecompFn fn; } RecompEntry;
 typedef struct { uint32_t addr; const char *name; } RecompName;
 
-typedef struct {
-    M68K *m68k_ptr;
-    uint8_t **ram_ptr;
-    uint32_t *jt_expected_ptr;
-    uint32_t (*recomp_bad_entry_fn)(uint32_t pc, uint32_t func);
-    uint32_t (*m68k_call_fn)(uint32_t target);
-    uint32_t (*m68k_exception_fn)(int vec, uint32_t addr);
-    uint32_t (*m68k_trap_fn)(int n, uint32_t func, uint32_t next);
-    uint32_t (*os9_syscall_fn)(uint32_t code, uint32_t next);
-    void (*jt_check_fn)(int reg, uint32_t addr);
-} RecompHostAPI;
-
-#ifdef RECOMP_PLUGIN_DLL
-#ifdef _WIN32
-#define RECOMP_EXPORT __declspec(dllexport)
-#else
-#define RECOMP_EXPORT __attribute__((visibility("default")))
-#endif
-extern RecompHostAPI recomp_host_api;
-#define m68k (*recomp_host_api.m68k_ptr)
-#define RAM  (*recomp_host_api.ram_ptr)
-#define jt_expected (*recomp_host_api.jt_expected_ptr)
-#define recomp_bad_entry recomp_host_api.recomp_bad_entry_fn
-#define m68k_call        recomp_host_api.m68k_call_fn
-#define m68k_exception   recomp_host_api.m68k_exception_fn
-#define m68k_trap        recomp_host_api.m68k_trap_fn
-#define os9_syscall      recomp_host_api.os9_syscall_fn
-#define jt_check         recomp_host_api.jt_check_fn
-#else
-#define RECOMP_EXPORT
-#endif
-
 extern RECOMP_EXPORT const RecompEntry recomp_entries[];
 extern RECOMP_EXPORT const int recomp_num_entries;
 extern RECOMP_EXPORT const RecompName recomp_names[];
@@ -136,7 +137,9 @@ void m68k_divs(int reg, uint32_t src, uint32_t addr);
    that the table register still points at the main program's table */
 #define JTCHECK(reg, addr) do { if (A(reg) != jt_expected) jt_check(reg, addr); } while (0)
 
+#ifndef RECOMP_PLUGIN_DLL
 int game_skip_insn(uint32_t addr);     /* frame.c: hooked instruction (cheats) */
+#endif
 
 uint8_t BCD_ADD(uint8_t d, uint8_t s);
 uint8_t BCD_SUB(uint8_t d, uint8_t s);

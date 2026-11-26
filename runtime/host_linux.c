@@ -2019,10 +2019,10 @@ static void *audio_thread(void *arg) {
             } else {
                 aud_lat_ema += (total - aud_lat_ema) * 0.01;   /* ~1.5 s time constant */
             }
-            /* Lock the target to the level the stream naturally settles at
-               after the first ~2 s, so we only correct drift, not latency. */
-            static int warm;
-            if (aud_target < 0.0 && ++warm > 120) aud_target = aud_lat_ema;
+            /* Target ~95 ms total latency (matching PulseAudio's ~100 ms
+               tlength) so the resampler only corrects true clock drift and
+               stays right around ratio=1.00000. */
+            if (aud_target < 0.0) aud_target = 44100.0 * 0.095;
             if (aud_target > 0.0) {
                 double dev = (aud_lat_ema - aud_target) / (44100.0 * 0.050); /* +/-50 ms -> full */
                 if (dev > 1.0) dev = 1.0;

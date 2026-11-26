@@ -121,6 +121,65 @@ static int find_or_fetch_portable_zig(const char *tool_dir, const char *comp_dir
     return 0;
 }
 
+#ifdef _WIN32
+/* Write a Clang/GCC/Zig response file listing all flags and recomp_*.c files
+   in gen_dir (Windows cmd.exe does not expand wildcards like recomp_*.c).
+   Paths are written with forward slashes so response-file parsing never treats
+   backslashes as escape sequences. */
+static void write_rsp_path(FILE *f, const char *p) {
+    fputc('"', f);
+    for (; *p; p++) fputc(*p == '\\' ? '/' : *p, f);
+    fputs("\"\n", f);
+}
+
+static int write_win_compile_rsp(const char *rsp_path, const char *tool_dir,
+                                 const char *gen_dir, const char *mod_path) {
+    FILE *f = fopen(rsp_path, "wb");
+    if (!f) return -1;
+    fprintf(f, "-shared\n-O2\n-DRECOMP_PLUGIN_DLL\n-Wno-unused-label\n");
+    char buf[1024];
+    fprintf(f, "-I");
+    snprintf(buf, sizeof buf, "%s/runtime", tool_dir);
+    write_rsp_path(f, buf);
+    fprintf(f, "-I");
+    write_rsp_path(f, gen_dir);
+    snprintf(buf, sizeof buf, "%s/runtime/alu.c", tool_dir);
+    write_rsp_path(f, buf);
+
+    char pat[1024];
+    snprintf(pat, sizeof pat, "%s\\recomp_*.c", gen_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    int count = 0;
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                snprintf(buf, sizeof buf, "%s/%s", gen_dir, fd.cFileName);
+                write_rsp_path(f, buf);
+                count++;
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    fprintf(f, "-o\n");
+    write_rsp_path(f, mod_path);
+    fclose(f);
+    return count > 0 ? 0 : -1;
+}
+
+static void log_compile_error(const char *log_path) {
+    FILE *f = fopen(log_path, "rb");
+    if (!f) return;
+    char line[512];
+    int lines = 0;
+    while (lines < 8 && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[0]) { LOG("  compiler: %s", line); lines++; }
+    }
+    fclose(f);
+}
+#endif
+
 static int compile_with_zig(const char *zig_bin, const char *comp_dir,
                             const char *tool_dir, const char *gen_dir,
                             const char *mod_path) {
@@ -130,15 +189,26 @@ static int compile_with_zig(const char *zig_bin, const char *comp_dir,
     MKDIR(cache_dir);
     char cmd[3600];
 #ifdef _WIN32
-    snprintf(cmd, sizeof cmd,
-             "cmd /c \"set \"ZIG_GLOBAL_CACHE_DIR=%s\" && set \"ZIG_LOCAL_CACHE_DIR=%s\" && \"%s\" cc -shared -O2 -DRECOMP_PLUGIN_DLL -Wno-unused-label -I\"%s/runtime\" -I\"%s\" \"%s/runtime/alu.c\" \"%s\"/recomp_*.c -o \"%s\" >nul 2>&1\"",
-             cache_dir, cache_dir, zig_bin, tool_dir, gen_dir, tool_dir, gen_dir, mod_path);
+    char rsp_path[850], log_path[850];
+    snprintf(rsp_path, sizeof rsp_path, "%s/compile.rsp", comp_dir);
+    snprintf(log_path, sizeof log_path, "%s/compile.log", comp_dir);
+    if (write_win_compile_rsp(rsp_path, tool_dir, gen_dir, mod_path) != 0) {
+        LOG("compile_with_zig: no recomp_*.c files found in %s", gen_dir);
+        return -1;
+    }
+    _putenv_s("ZIG_GLOBAL_CACHE_DIR", cache_dir);
+    _putenv_s("ZIG_LOCAL_CACHE_DIR", cache_dir);
+    /* Outer quotes are required by cmd.exe whenever the executable path is quoted. */
+    snprintf(cmd, sizeof cmd, "\"\"%s\" cc @\"%s\" >\"%s\" 2>&1\"", zig_bin, rsp_path, log_path);
+    int rc = system(cmd);
+    if (rc != 0) log_compile_error(log_path);
+    return rc;
 #else
     snprintf(cmd, sizeof cmd,
              "ZIG_GLOBAL_CACHE_DIR='%s' ZIG_LOCAL_CACHE_DIR='%s' '%s' cc -shared -fPIC -O2 -Wl,--allow-shlib-undefined -Wno-unused-label -I'%s/runtime' -I'%s' '%s'/recomp_*.c -o '%s.tmp' 2>/dev/null && mv -f '%s.tmp' '%s'",
              cache_dir, cache_dir, zig_bin, tool_dir, gen_dir, gen_dir, mod_path, mod_path, mod_path);
-#endif
     return system(cmd);
+#endif
 }
 
 /* When a binary or AppImage is distributed without any derived game code
@@ -240,11 +310,17 @@ void cpu_derive_user_code(const char *exe_dir, const char *disc_bin_path) {
                 if (is_sys_zig) {
                     rc = compile_with_zig(cc_bin, comp_dir, tool_dir, gen_dir, mod_path);
                 } else {
-                    char cmd[2800];
-                    snprintf(cmd, sizeof cmd,
-                             "%s -shared -O2 -DRECOMP_PLUGIN_DLL -Wno-unused-label -I\"%s/runtime\" -I\"%s\" \"%s/runtime/alu.c\" \"%s\"/recomp_*.c -o \"%s\" >nul 2>&1",
-                             cc_bin, tool_dir, gen_dir, tool_dir, gen_dir, mod_path);
-                    rc = system(cmd);
+                    char rsp_path[850], log_path[850], cmd[2800];
+                    MKDIR(comp_dir);
+                    snprintf(rsp_path, sizeof rsp_path, "%s/compile.rsp", comp_dir);
+                    snprintf(log_path, sizeof log_path, "%s/compile.log", comp_dir);
+                    if (write_win_compile_rsp(rsp_path, tool_dir, gen_dir, mod_path) == 0) {
+                        snprintf(cmd, sizeof cmd, "\"%s @\"%s\" >\"%s\" 2>&1\"", cc_bin, rsp_path, log_path);
+                        rc = system(cmd);
+                        if (rc != 0) log_compile_error(log_path);
+                    } else {
+                        rc = -1;
+                    }
                 }
                 if (rc == 0) compiled_ok = 1;
                 else LOG("system compiler %s failed (%d)", cc_bin, rc);
@@ -328,7 +404,7 @@ void cpu_derive_user_code(const char *exe_dir, const char *disc_bin_path) {
                 static const RecompHostAPI api = {
                     &m68k, &RAM, &jt_expected,
                     recomp_bad_entry, m68k_call, m68k_exception,
-                    m68k_trap, os9_syscall, jt_check
+                    m68k_trap, os9_syscall, jt_check, game_skip_insn
                 };
                 pinit(&api);
             }

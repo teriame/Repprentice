@@ -1427,10 +1427,11 @@ void host_poll(void) {
 /* ---------------------------------------------------------------- audio */
 #define NBUF 12
 #define BUF_FRAMES 1470
+#define WIN_PREFILL_BUFS 3
 static HWAVEOUT wo;
 static WAVEHDR hdrs[NBUF];
 static int16_t bufs[NBUF][BUF_FRAMES * 2];
-static int cur_buf, cur_fill;
+static int cur_buf, cur_fill, wo_paused;
 
 void host_audio_init(int rate) {
     if (g_headless) return;
@@ -1451,6 +1452,11 @@ void host_audio_init(int rate) {
         hdrs[i].dwBufferLength = BUF_FRAMES * 4;
         hdrs[i].dwFlags = WHDR_DONE;
     }
+    /* Pause waveOut until WIN_PREFILL_BUFS (~100 ms) are queued so the
+       playback stream starts with a full cushion and never underruns on
+       minor frame-time jitter or 59.94 Hz vsync. */
+    waveOutPause(wo);
+    wo_paused = 1;
 }
 
 int host_audio_queued(void) {
@@ -1499,6 +1505,16 @@ void host_audio_push(const int16_t *s, int frames) {
             waveOutWrite(wo, h, sizeof *h);
             cur_buf = (cur_buf + 1) % NBUF;
             cur_fill = 0;
+            if (wo_paused && host_audio_queued() >= WIN_PREFILL_BUFS) {
+                waveOutRestart(wo);
+                wo_paused = 0;
+            }
         }
+    }
+    /* If all buffers drained (e.g. after a long pause/menu), re-arm the
+       prefill cushion before restarting playback. */
+    if (!wo_paused && host_audio_queued() == 0) {
+        waveOutPause(wo);
+        wo_paused = 1;
     }
 }

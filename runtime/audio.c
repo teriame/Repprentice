@@ -114,7 +114,10 @@ void audio_feed_cdda(const uint8_t *sec) {
         cdda_playing = 1;
 }
 
+static void audio_trigger_declick(void);
+
 void audio_flush_disc(void) {
+    if (disc_playing) audio_trigger_declick();
     disc_ring.rd = disc_ring.wr = 0;
     disc_playing = 0;
     memset(&disc_rs, 0, sizeof disc_rs);
@@ -122,6 +125,7 @@ void audio_flush_disc(void) {
 }
 
 void audio_flush_cdda(void) {
+    if (cdda_playing) audio_trigger_declick();
     cdda_ring.rd = cdda_ring.wr = 0;
     cdda_playing = 0;
 }
@@ -267,6 +271,33 @@ static void sm_finished(int64_t at) {
 /* ---------------------------------------------------------------- mixing */
 static int16_t mixbuf[2 * 8192];
 static int mixn;
+/* Smoothed attenuator gains and short de-click offset so SC_Atten steps and
+   abrupt stream flushes/stops never produce audible pops or clicks. */
+static double sgll = 1.0, sglr = 0.0, sgrr = 1.0, sgrl = 0.0;
+static double dc_off_l = 0.0, dc_off_r = 0.0;
+static double prev_mix_l = 0.0, prev_mix_r = 0.0;
+
+static void audio_trigger_declick(void) {
+    /* Carry over the previous sample level as a ~1.5 ms decaying offset so
+       an abrupt cut to zero fades smoothly instead of popping. */
+    dc_off_l = prev_mix_l;
+    dc_off_r = prev_mix_r;
+}
+
+static int16_t soft_clip16(double v) {
+    /* Linear up to +/-30000; smooth knee between 30000 and 32767 so brief
+       multi-source peaks never hard-clip into digital crackles. */
+    const double knee = 30000.0;
+    const double head = 2767.0;
+    if (v > knee) {
+        double x = (v - knee) / head;
+        v = knee + head * (x / (1.0 + x));
+    } else if (v < -knee) {
+        double x = (-v - knee) / head;
+        v = -(knee + head * (x / (1.0 + x)));
+    }
+    return clamp16((int)v);
+}
 
 static double gain_of(int a) {
     if (a >= 0x80) return 0.0;
@@ -276,6 +307,12 @@ static double gain_of(int a) {
 static void render_until(int64_t target) {
     if (target <= rendered) return;
     double gll = gain_of(atten[0]), glr = gain_of(atten[1]), grr = gain_of(atten[2]), grl = gain_of(atten[3]);
+    /* On CD-i hardware, routing both input channels to the same output bus
+       (e.g. SC_Atten 00000000 for mono music.rtf) sums with -6 dB headroom
+       so mono duplicated to L & R stays at unity (0 dB) instead of +6 dB
+       hard clipping. */
+    if (atten[0] < 0x80 && atten[3] < 0x80) { gll *= 0.5; grl *= 0.5; }
+    if (atten[2] < 0x80 && atten[1] < 0x80) { grr *= 0.5; glr *= 0.5; }
     while (rendered < target) {
         int l = 0, r = 0;
         while (cur.active) {
@@ -310,10 +347,22 @@ static void render_until(int64_t target) {
                 cdda_playing = 0;
             }
         }
+        /* Smooth gain transitions (~1 ms) to prevent SC_Atten zipper clicks */
+        sgll += (gll - sgll) * 0.02;
+        sglr += (glr - sglr) * 0.02;
+        sgrr += (grr - sgrr) * 0.02;
+        sgrl += (grl - sgrl) * 0.02;
         if (mixn < 8192) {
-            double ol = l * gll + r * grl, or_ = r * grr + l * glr;
-            mixbuf[mixn * 2] = clamp16((int)ol);
-            mixbuf[mixn * 2 + 1] = clamp16((int)or_);
+            double ol = l * sgll + r * sgrl + dc_off_l;
+            double or_ = r * sgrr + l * sglr + dc_off_r;
+            dc_off_l *= 0.985;
+            dc_off_r *= 0.985;
+            if (fabs(dc_off_l) < 0.5) dc_off_l = 0.0;
+            if (fabs(dc_off_r) < 0.5) dc_off_r = 0.0;
+            prev_mix_l = ol;
+            prev_mix_r = or_;
+            mixbuf[mixn * 2] = soft_clip16(ol);
+            mixbuf[mixn * 2 + 1] = soft_clip16(or_);
             mixn++;
         }
         rendered++;
