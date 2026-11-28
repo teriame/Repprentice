@@ -350,10 +350,13 @@ static void ev_activate(int idx, int all) {
 /* ------------------------------------------------------------ scheduler */
 static int64_t next_field, next_sector;
 static int64_t field_period, sector_period;
+static int field_rem, sector_rem;
 
 void sched_init(void) {
     field_period = CPU_IPS / FIELD_RATE;
     sector_period = CPU_IPS / SECTOR_RATE;
+    field_rem = CPU_IPS % FIELD_RATE;
+    sector_rem = CPU_IPS % SECTOR_RATE;
     next_field = field_period;
     next_sector = sector_period;
     m68k.cyc_limit = next_sector < next_field ? next_sector : next_field;
@@ -388,14 +391,25 @@ static void run_events(void) {
     for (;;) {
         int progressed = 0;
         if (m68k.cyc >= audio_next_event()) { audio_event(); progressed = 1; }
-        if (m68k.cyc >= next_sector) { next_sector += sector_period; cdfm_sector_tick(); progressed = 1; }
-        if (m68k.cyc >= next_field) {
-            next_field += field_period;
+        /* Process sector and field ticks in exact chronological order, using
+           Bresenham remainder accumulation so 60 Hz fields and 75 Hz sectors
+           both span an exact 4,000,000 cycles/sec with zero drift. */
+        if (m68k.cyc >= next_field && (m68k.cyc < next_sector || next_field <= next_sector)) {
+            field_rem += CPU_IPS % FIELD_RATE;
+            int extra = field_rem >= FIELD_RATE ? (field_rem -= FIELD_RATE, 1) : 0;
+            next_field += field_period + extra;
             video_field();
             audio_field_tick();
             field_tick();
             fields_pending++;
             if (cur) sched_stop = 1;    /* reach the frame boundary promptly */
+            progressed = 1;
+        }
+        if (m68k.cyc >= next_sector) {
+            sector_rem += CPU_IPS % SECTOR_RATE;
+            int extra = sector_rem >= SECTOR_RATE ? (sector_rem -= SECTOR_RATE, 1) : 0;
+            next_sector += sector_period + extra;
+            cdfm_sector_tick();
             progressed = 1;
         }
         alarms_check();

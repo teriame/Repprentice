@@ -2019,15 +2019,16 @@ static void *audio_thread(void *arg) {
             } else {
                 aud_lat_ema += (total - aud_lat_ema) * 0.01;   /* ~1.5 s time constant */
             }
-            /* Target ~95 ms total latency (matching PulseAudio's ~100 ms
-               tlength) so the resampler only corrects true clock drift and
-               stays right around ratio=1.00000. */
-            if (aud_target < 0.0) aud_target = 44100.0 * 0.095;
+            /* Target ~105 ms total latency (matching PulseAudio/PipeWire's
+               natural steady-state cushion with tlength=100 ms) so the
+               resampler stays centered near 1.00000. */
+            if (aud_target < 0.0) aud_target = 44100.0 * 0.105;
             if (aud_target > 0.0) {
                 double dev = (aud_lat_ema - aud_target) / (44100.0 * 0.050); /* +/-50 ms -> full */
                 if (dev > 1.0) dev = 1.0;
                 if (dev < -1.0) dev = -1.0;
-                double want = 1.0 + 0.002 * dev;
+                double max_adj = (avail > AUD_CHUNK * 6) ? 0.005 : 0.002;
+                double want = 1.0 + max_adj * dev;
                 aud_ratio += (want - aud_ratio) * 0.02;            /* glide, no steps */
             }
         }

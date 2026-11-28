@@ -41,6 +41,7 @@ static struct {
 } cdda;
 
 void audio_feed_cdda(const uint8_t *sector2352);
+void audio_event(void);
 
 /* name: path below /cd ("music.rtf", "CDDA/track2.cda", "CDDA", "@") */
 int cdfm_open(const char *name, int mode) {
@@ -192,6 +193,9 @@ static void deliver_to_pcl(uint32_t cil, int chan, const uint8_t *raw, uint32_t 
     WB(pcl + 2, submode);
     WB(pcl + 3, coding);
     if (buf) {
+        /* Advance SoundMap playback up to the current CPU cycle before DMA
+           overwrites a ring-buffered SoundMap slot in RAM (e.g. music.rtf). */
+        audio_event();
         memcpy(RAM + ((buf + cnt) & MEM_MASK), raw + 24, size);
         cnt += size;
         WL(pcl + 24, cnt);
